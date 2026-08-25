@@ -576,7 +576,11 @@ export const APP_HTML = `<!doctype html>
           });
         });
         fragment.querySelector('[data-action="not_useful"]').addEventListener('click', function (event) {
-          if (!window.confirm('Tell Aries to stop making tasks out of emails like this one?\n\n' + item.title)) return;
+          // Double-escaped on purpose. This whole file is ONE template literal, so a
+          // single-backslash escape is resolved when the module loads: it arrives in the
+          // served HTML as a real line break, leaves this string unterminated, and takes the
+          // entire inline script down with it. The page then renders completely blank.
+          if (!window.confirm('Tell Aries to stop making tasks out of emails like this one?\\n\\n' + item.title)) return;
           const target = event.currentTarget;
           const owner = target.closest('.card');
           submitAction(target, { operation: 'not_useful', id: item.id }, function () { if (owner) owner.remove(); });
