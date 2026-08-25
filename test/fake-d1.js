@@ -78,6 +78,11 @@ class FakeD1Statement {
         .map((operation) => ({ ...operation }))
       return result(rows)
     }
+    // Which cards have a rendered email chain. The board serves this so the UI can offer
+    // "Open email" only where there is one to open.
+    if (this.query.includes('from board_threads')) {
+      return result([...this.database.threads.keys()].map((item_id) => ({ item_id })))
+    }
     throw new Error(`Unsupported D1 all(): ${this.query}`)
   }
 

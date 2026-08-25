@@ -525,6 +525,8 @@ export const APP_HTML = `<!doctype html>
       return item.priority === 1 || String(item.priority || '').toLowerCase() === 'urgent';
     }
 
+    let threadIds = new Set();
+
     function render(items) {
       board.replaceChildren();
       const open = items.filter(function (item) { return item.status !== 'done'; });
@@ -601,7 +603,11 @@ export const APP_HTML = `<!doctype html>
         // point is that anyone on the team can read the chain and decide who takes it.
         // (The served HTML must not contain the provider's name — see ui.test.js.)
         const sourceLink = fragment.querySelector('[data-action="source"]');
-        sourceLink.hidden = !item.source_url;
+        // Only offer it when a chain was actually rendered for this card. It used to appear
+        // wherever a source link could be BUILT, which is not the same thing: cards whose
+        // mailbox could not be resolved got a button that opened a dialog saying there was no
+        // source email.
+        sourceLink.hidden = !threadIds.has(item.id);
         sourceLink.removeAttribute('href');
         sourceLink.setAttribute('role', 'button');
         sourceLink.tabIndex = 0;
@@ -914,6 +920,7 @@ export const APP_HTML = `<!doctype html>
         const payload = await response.json();
         setFreshness(payload);
         boardItems = Array.isArray(payload.items) ? payload.items : [];
+        threadIds = new Set(Array.isArray(payload.thread_ids) ? payload.thread_ids : []);
         render(boardItems);
         renderChecked();
       } catch (error) {

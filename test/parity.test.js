@@ -277,3 +277,25 @@ test('carries the note history, with its author and time, and refuses a malforme
     assert.equal(response.status, 400, JSON.stringify(item).slice(0, 70))
   }
 })
+
+test('the board says which cards actually have an email chain', async () => {
+  const db = new FakeD1Database()
+  const env = settings(db)
+
+  await worker.fetch(publish('/api/sync/snapshot', {
+    items: [
+      { id: 101, title: 'Made from an email' },
+      { id: 102, title: 'Never came from an email' },
+    ],
+  }), env, {})
+  await worker.fetch(publish('/api/sync/threads', {
+    threads: [{ item_id: 101, subject: 'Re: claim', mailbox: 'steve@restorationdoctors.com',
+                messages: [{ from: 'a@b.com', body: 'hello', truncated: false }] }],
+  }), env, {})
+
+  const payload = await (await worker.fetch(read('/api/board'), env, {})).json()
+  // The UI hides "Open email" on anything absent here. It used to offer the button wherever a
+  // link could be BUILT, which is not the same thing: a card whose mailbox could not be
+  // resolved got a button whose only job was to say there was no source email.
+  assert.deepEqual(payload.thread_ids, [101])
+})

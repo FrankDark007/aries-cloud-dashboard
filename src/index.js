@@ -931,8 +931,16 @@ async function getBoard(request, env) {
   const ageSeconds = Number.isFinite(publishedMillis)
     ? Math.max(0, Math.floor((Date.now() - publishedMillis) / 1000))
     : null
+  // Which items actually have a readable email chain. Not every card does: some were never
+  // made from an email, and for others the mailbox could not be resolved so nothing was
+  // rendered. Without this the UI offered "Open email" on every card and a third of them
+  // answered "No source email for this item" -- a button that exists only to apologise.
+  const threadRows = await env.DB.prepare('SELECT item_id FROM board_threads').all()
+  const threadIds = (threadRows.results || []).map((entry) => entry.item_id)
+
   return json({
     items: snapshot.items,
+    thread_ids: threadIds,
     published_at: row.published_at,
     stale: {
       is_stale: ageSeconds === null || ageSeconds > threshold,
