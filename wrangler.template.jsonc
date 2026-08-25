@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "aries-cloud-dashboard",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "aries.flood.doctor",
+      "custom_domain": true
+    },
+    {
+      "pattern": "aries-publish.flood.doctor",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "ALLOWED_EMAILS": "REPLACE_WITH_EXACT_COMMA_SEPARATED_EMAILS",
+    "STALE_AFTER_SECONDS": "300"
+  },
+  "secrets": {
+    "required": ["PUBLISHER_TOKEN"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aries-cloud-dashboard",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05
+    }
+  }
+}
