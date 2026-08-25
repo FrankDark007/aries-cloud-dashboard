@@ -221,6 +221,12 @@ export const APP_HTML = `<!doctype html>
     .card-action.source-link[hidden] { display: none; }
     .card-action.danger { flex: 0 0 auto; color: #a1231f; border-color: #e6c3c1; }
     .card-action.danger:hover { background: #fdf2f1; }
+    /* The thumbs sit on their own row: they teach the inbox sweep rather than change the task,
+       and mixing them in with Done/Delete invites a mis-click on the one control here that has
+       a lasting effect on what Aries shows everybody. */
+    .feedback-group { flex: 1 0 100%; display: flex; gap: 8px; margin-top: 2px; padding-top: 8px; border-top: 1px dashed var(--line, #e3e6ec); }
+    .card-action.thumb { flex: 1; font-size: .85rem; color: var(--muted, #5d6674); }
+    .card-action.thumb:disabled { opacity: .6; cursor: default; }
     .worklist { display: flex; flex-direction: column; gap: 6px; }
     .worklist-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: start;
       padding: 11px 14px; background: white; border: 1px solid #e4e7ec; border-radius: 11px; }
@@ -392,6 +398,10 @@ export const APP_HTML = `<!doctype html>
         <button class="card-action" data-action="snooze" type="button">Snooze</button>
         <a class="card-action source-link" data-action="source" target="_blank" rel="noreferrer noopener">Open email</a>
         <button class="card-action danger" data-action="delete" type="button">Delete</button>
+        <span class="feedback-group">
+          <button class="card-action thumb" data-action="useful" type="button" title="Aries was right to make this a task">&#128077; Right call</button>
+          <button class="card-action thumb" data-action="not_useful" type="button" title="Stop turning emails like this into tasks">&#128078; Not a task</button>
+        </span>
       </div>
     </article>
   </template>
@@ -554,6 +564,24 @@ export const APP_HTML = `<!doctype html>
           const owner = target.closest('.card');
           submitAction(target, { operation: 'delete', id: item.id }, function () { if (owner) owner.remove(); });
         });
+        // The thumbs teach the inbox sweep, they do not change the task. "Right call" confirms
+        // this sender is worth a card and protects them from being muted by a stray click on a
+        // sibling thread; "Not a task" says stop making cards out of mail like this, and takes
+        // the card away, because leaving it sitting there is what makes a button look broken.
+        fragment.querySelector('[data-action="useful"]').addEventListener('click', function (event) {
+          const target = event.currentTarget;
+          submitAction(target, { operation: 'useful', id: item.id }, function () {
+            target.textContent = '\u{1F44D} Noted';
+            target.disabled = true;
+          });
+        });
+        fragment.querySelector('[data-action="not_useful"]').addEventListener('click', function (event) {
+          if (!window.confirm('Tell Aries to stop making tasks out of emails like this one?\n\n' + item.title)) return;
+          const target = event.currentTarget;
+          const owner = target.closest('.card');
+          submitAction(target, { operation: 'not_useful', id: item.id }, function () { if (owner) owner.remove(); });
+        });
+
         fragment.querySelector('[data-action="note"]').addEventListener('click', function () {
           noteItem = item;
           document.querySelector('#note-target').textContent = '#' + item.id + ' · ' + item.title;
@@ -856,6 +884,8 @@ export const APP_HTML = `<!doctype html>
       snooze: 'Snoozed.',
       delete: 'Delete queued for Aries.',
       reorder: 'Reordered.',
+      useful: 'Noted \u2014 Aries will keep flagging these.',
+      not_useful: 'Noted \u2014 Aries will stop flagging these.',
     };
 
     async function submitAction(button, payload, onAccepted) {

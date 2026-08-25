@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS board_snapshot (
 CREATE TABLE IF NOT EXISTS command_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   operation TEXT NOT NULL CHECK (
-    operation IN ('done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete')
+    operation IN ('done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete',
+                  'useful', 'not_useful')
   ),
   item_id INTEGER NOT NULL CHECK (item_id > 0),
   note TEXT,
@@ -30,7 +31,7 @@ CREATE TABLE IF NOT EXISTS command_queue (
   CHECK (
     (operation IN ('assign', 'snooze', 'reorder') AND value IS NOT NULL AND length(value) <= 240)
     OR
-    (operation IN ('done', 'reopen', 'note', 'delete') AND value IS NULL)
+    (operation IN ('done', 'reopen', 'note', 'delete', 'useful', 'not_useful') AND value IS NULL)
   )
 );
 

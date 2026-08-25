@@ -74,7 +74,13 @@ const STRING_LIMITS = Object.freeze({
 // Teammates the board can be assigned to. An assignment is applied by Aries, so this list
 // only has to agree with the roster team-tools.sh accepts.
 const BOARD_ASSIGNEES = Object.freeze(['frank', 'mark', 'dom', 'steve', 'shayan', 'katherine', 'aries'])
-const BOARD_OPERATIONS = Object.freeze(['done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete'])
+// `useful` / `not_useful` are the thumbs on a card. They change nothing about the task; they
+// are how the team tells Aries whether an email of that shape should have become a card at
+// all, so the next inbox sweep stops repeating a mistake. Neither takes an argument -- the
+// card already identifies the sender, and the sender is what gets learned.
+const BOARD_OPERATIONS = Object.freeze([
+  'done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete', 'useful', 'not_useful',
+])
 const MAX_WORKLIST_ITEMS = 1000
 const MAX_THREADS = 60
 const MAX_THREAD_MESSAGES = 20
