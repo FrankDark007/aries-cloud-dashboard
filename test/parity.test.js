@@ -243,3 +243,37 @@ test('refuses an oversized or malformed thread rather than storing part of it', 
     assert.equal(response.status, 400, JSON.stringify(body).slice(0, 60))
   }
 })
+
+test('carries the note history, with its author and time, and refuses a malformed one', async () => {
+  const db = new FakeD1Database()
+  const env = settings(db)
+
+  const notes = [
+    { at: '2026-08-24', by: '', text: 'written before notes had an author' },
+    { at: '2026-08-25T03:11:02+00:00', by: 'mark@flood.doctor', text: 'called the adjuster back' },
+  ]
+  const published = await worker.fetch(publish('/api/sync/snapshot', {
+    items: [{ id: 91, title: 'Chase the Sedgwick invoice', note: 'called the adjuster back', notes }],
+  }), env, {})
+  assert.equal(published.status, 200)
+
+  const board = await worker.fetch(read('/api/board'), env, {})
+  const item = (await board.json()).items[0]
+  assert.deepEqual(item.notes, notes)
+  // An unattributed note is expected on older rows and must survive rather than be dropped.
+  assert.equal(item.notes[0].by, '')
+  assert.equal(item.notes[1].by, 'mark@flood.doctor')
+
+  // A publisher that starts sending something unexpected here should fail loudly.
+  const refusals = [
+    { id: 92, title: 'x', notes: 'not an array' },
+    { id: 93, title: 'x', notes: [{ at: '2026-08-25', by: 'mark@flood.doctor' }] },   // no text
+    { id: 94, title: 'x', notes: [{ at: '2026-08-25', by: 12, text: 'ok' }] },
+    { id: 95, title: 'x', notes: [{ at: '2026-08-25', by: '', text: 'x'.repeat(2001) }] },
+    { id: 96, title: 'x', notes: Array.from({ length: 21 }, () => ({ at: '', by: '', text: 'x' })) },
+  ]
+  for (const item of refusals) {
+    const response = await worker.fetch(publish('/api/sync/snapshot', { items: [item] }), env, {})
+    assert.equal(response.status, 400, JSON.stringify(item).slice(0, 70))
+  }
+})

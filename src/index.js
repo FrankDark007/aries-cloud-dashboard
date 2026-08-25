@@ -71,6 +71,7 @@ const STRING_LIMITS = Object.freeze({
   source_url: 2048,
   snoozed_until: 80,
 })
+const MAX_NOTES = 20
 // Teammates the board can be assigned to. An assignment is applied by Aries, so this list
 // only has to agree with the roster team-tools.sh accepts.
 const BOARD_ASSIGNEES = Object.freeze(['frank', 'mark', 'dom', 'steve', 'shayan', 'katherine', 'aries'])
@@ -239,6 +240,31 @@ function hasJsonContentType(request) {
  * @param {unknown} item
  * @returns {BoardItem|null}
  */
+/**
+ * A card's note history. Refused outright rather than trimmed: a publisher that starts sending
+ * something unexpected here should fail loudly, not have it quietly reshaped on the way in.
+ * @param {unknown} value
+ * @returns {Array<{at: string, by: string, text: string}>|null}
+ */
+function curateNotes(value) {
+  if (!Array.isArray(value) || value.length > MAX_NOTES) return null
+  const notes = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+    const source = /** @type {Record<string, unknown>} */ (entry)
+    const text = typeof source.text === 'string' ? source.text : ''
+    const at = typeof source.at === 'string' ? source.at : ''
+    // An unattributed note is expected -- rows written before notes had authors carry one --
+    // so an empty author is valid and the UI says so plainly rather than inventing a name.
+    const by = source.by === undefined || source.by === null ? '' : source.by
+    if (typeof by !== 'string') return null
+    if (!text.trim() || text.length > STRING_LIMITS.note) return null
+    if (at.length > 80 || by.length > 160) return null
+    notes.push({ at, by, text })
+  }
+  return notes
+}
+
 function curateItem(item) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return null
   const source = /** @type {Record<string, unknown>} */ (item)
@@ -260,6 +286,14 @@ function curateItem(item) {
     const validString = typeof source.priority === 'string' && source.priority.length <= 64
     if (!validNumber && !validString) return null
     curated.priority = /** @type {number|string} */ (source.priority)
+  }
+  // The note history. A card used to carry one note string that each new note overwrote, with
+  // no author and no time, so it could say something without saying who said it. Three
+  // surfaces write to this board, which makes an unattributed note close to useless.
+  if (source.notes !== undefined && source.notes !== null) {
+    const notes = curateNotes(source.notes)
+    if (!notes) return null
+    if (notes.length) curated.notes = notes
   }
   return /** @type {BoardItem} */ (curated)
 }

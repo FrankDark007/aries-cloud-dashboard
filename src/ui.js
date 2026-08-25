@@ -209,8 +209,12 @@ export const APP_HTML = `<!doctype html>
     .card .summary { display: -webkit-box; overflow: hidden; margin: 0; color: var(--muted); -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
     .details { display: grid; gap: 5px; margin: 16px 0; color: #596170; font-size: 12px; }
     .detail:empty { display: none; }
-    .item-note { margin: 0 0 16px; padding: 10px 11px; color: #505764; background: #f7f8fa; border-left: 2px solid #aab2bf; border-radius: 0 8px 8px 0; font-size: 12px; font-style: italic; }
+    .item-note { margin: 0 0 16px; padding: 10px 11px; color: #505764; background: #f7f8fa; border-left: 2px solid #aab2bf; border-radius: 0 8px 8px 0; font-size: 12px; }
     .item-note:empty { display: none; }
+    .note-entry + .note-entry { margin-top: 9px; padding-top: 9px; border-top: 1px solid #e5e8ed; }
+    .note-entry .note-text { font-style: italic; white-space: pre-wrap; }
+    .note-entry .note-by { display: block; margin-top: 3px; font-style: normal; font-size: 11px; color: var(--faint); }
+    .note-entry.pending { opacity: .7; }
     .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 5px; }
     .card-action { flex: 1; padding: 8px 12px; }
     .card-action.primary { color: white; background: var(--ink); border-color: var(--ink); }
@@ -458,6 +462,7 @@ export const APP_HTML = `<!doctype html>
     const threadTitle = document.querySelector('#thread-title');
     const threadMailbox = document.querySelector('#thread-mailbox');
     let noteItem = null;
+    let noteHost = null;
     let toastTimer = null;
     let activeView = 'board';
 
@@ -467,6 +472,40 @@ export const APP_HTML = `<!doctype html>
       toast.classList.toggle('error', Boolean(isError));
       toast.classList.add('show');
       toastTimer = window.setTimeout(function () { toast.classList.remove('show'); }, 4200);
+    }
+
+    // A note is shown with WHO wrote it and WHEN. It used to render as one anonymous line of
+    // italics, so a card could say something without saying who said it -- and three different
+    // surfaces write to this board. Rows written before notes carried an author have none, and
+    // that is stated plainly rather than filled in with a guess.
+    function renderNotes(host, item) {
+      host.textContent = '';
+      const entries = Array.isArray(item.notes) && item.notes.length
+        ? item.notes
+        : (item.note ? [{ text: item.note, by: '', at: item.updated || '' }] : []);
+      entries.forEach(function (entry) { host.append(noteEntry(entry)); });
+    }
+
+    function noteEntry(entry) {
+      const wrap = document.createElement('div');
+      wrap.className = 'note-entry' + (entry.pending ? ' pending' : '');
+      const text = document.createElement('span');
+      text.className = 'note-text';
+      text.textContent = entry.text || '';
+      const by = document.createElement('span');
+      by.className = 'note-by';
+      const who = shortName(entry.by);
+      const when = entry.at ? formatTime(entry.at) : '';
+      by.textContent = [who || 'author not recorded', when].filter(Boolean).join(' · ')
+        + (entry.pending ? ' · sending to Aries' : '');
+      wrap.append(text, by);
+      return wrap;
+    }
+
+    function shortName(email) {
+      if (!email) return '';
+      const local = String(email).split('@')[0];
+      return local ? local.charAt(0).toUpperCase() + local.slice(1) : '';
     }
 
     function formatTime(value) {
@@ -520,7 +559,7 @@ export const APP_HTML = `<!doctype html>
         fragment.querySelector('.assignee').textContent = item.assignee ? 'Assigned to ' + item.assignee : '';
         fragment.querySelector('.due').textContent = item.due ? 'Due ' + item.due : '';
         fragment.querySelector('.updated').textContent = item.updated ? 'Updated ' + formatTime(item.updated) : '';
-        fragment.querySelector('.item-note').textContent = item.note || '';
+        renderNotes(fragment.querySelector('.item-note'), item);
         // Done removes the card immediately. It used to sit there unchanged until the next
         // 30s publish, which read as "the button does nothing" and got clicked repeatedly.
         fragment.querySelector('[data-action="done"]').addEventListener('click', function (event) {
@@ -531,6 +570,7 @@ export const APP_HTML = `<!doctype html>
           });
         });
 
+        const assigneeLine = fragment.querySelector('.assignee');
         const assignSelect = fragment.querySelector('[data-action="assign"]');
         assignSelect.append(new Option('Unassigned', ''));
         ASSIGNEES.forEach(function (person) {
@@ -538,7 +578,16 @@ export const APP_HTML = `<!doctype html>
         });
         assignSelect.value = (item.assignee || '').toLowerCase();
         assignSelect.addEventListener('change', function (event) {
-          submitAction(event.currentTarget, { operation: 'assign', id: item.id, value: event.currentTarget.value });
+          const chosen = event.currentTarget.value;
+          // Reflect the choice on the card at once. The change only reaches the board on the
+          // next sync, and a dropdown that snapped back to the old owner in the meantime is
+          // what made assignment look like it "keeps reverting".
+          submitAction(event.currentTarget, { operation: 'assign', id: item.id, value: chosen }, function () {
+            item.assignee = chosen;
+            assigneeLine.textContent = chosen
+              ? 'Assigned to ' + chosen + ' · reaching Aries'
+              : 'Unassigned · reaching Aries';
+          });
         });
 
         fragment.querySelector('[data-action="snooze"]').addEventListener('click', function (event) {
@@ -588,6 +637,7 @@ export const APP_HTML = `<!doctype html>
 
         fragment.querySelector('[data-action="note"]').addEventListener('click', function () {
           noteItem = item;
+          noteHost = fragment.querySelector('.item-note');
           document.querySelector('#note-target').textContent = '#' + item.id + ' · ' + item.title;
           noteText.value = '';
           noteDialog.showModal();
@@ -903,7 +953,9 @@ export const APP_HTML = `<!doctype html>
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'Action was not queued');
         showToast(ACTION_WORDING[payload.operation] || 'Queued for Aries.', false);
-        if (typeof onAccepted === 'function') onAccepted();
+        // The accepted row carries the identity Access proved and the time the worker stamped.
+        // Callers render from THAT rather than guessing at either.
+        if (typeof onAccepted === 'function') onAccepted(result.command || {});
       } catch (error) {
         showToast(error.message || 'Action failed', true);
       } finally {
@@ -916,8 +968,19 @@ export const APP_HTML = `<!doctype html>
       const value = noteText.value.trim();
       if (!noteItem || !value) return;
       noteDialog.close();
-      submitAction(null, { operation: 'note', id: noteItem.id, note: value });
+      const item = noteItem;
+      const host = noteHost;
+      // Show it on the card straight away, marked as still on its way. The note only reaches
+      // the board on the next sync, and a card that looked completely unchanged afterwards is
+      // why the button read as doing nothing at all.
+      submitAction(null, { operation: 'note', id: item.id, note: value }, function (command) {
+        const entry = { text: value, by: command.actor_email || '', at: command.created_at || '', pending: true };
+        item.notes = (Array.isArray(item.notes) ? item.notes : []).concat([entry]);
+        item.note = value;
+        if (host) host.append(noteEntry(entry));
+      });
       noteItem = null;
+      noteHost = null;
     });
     document.querySelector('#note-cancel').addEventListener('click', function () { noteDialog.close(); noteItem = null; });
     document.querySelector('#thread-close').addEventListener('click', function () { threadDialog.close(); });
