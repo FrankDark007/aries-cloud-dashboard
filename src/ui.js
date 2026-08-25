@@ -230,6 +230,16 @@ export const APP_HTML = `<!doctype html>
     .worklist-text { min-width: 0; overflow-wrap: anywhere; }
     .worklist-meta { display: flex; gap: 8px; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 700; }
     #worklist-filter { min-width: 180px; }
+    .checked-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center;
+      padding: 12px 14px; background: white; border: 1px solid #e4e7ec; border-radius: 11px; }
+    .checked-row .worklist-text { text-decoration: line-through; color: var(--muted); }
+    .checked-row .card-action { flex: 0 0 auto; }
+    .thread-body { max-width: min(760px, 92vw); max-height: 80vh; overflow-y: auto; }
+    .thread-message { padding: 12px 0; border-top: 1px solid #e4e7ec; }
+    .thread-message:first-of-type { border-top: none; }
+    .thread-meta { display: block; color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 6px; overflow-wrap: anywhere; }
+    .thread-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.5; }
+    .thread-truncated { color: var(--muted); font-size: 12px; font-style: italic; }
     .empty {
       grid-column: 1 / -1;
       padding: 54px 24px;
@@ -322,6 +332,7 @@ export const APP_HTML = `<!doctype html>
       <button id="show-board" type="button" aria-pressed="true">Board</button>
       <button id="show-todos" type="button" aria-pressed="false">To-Do</button>
       <button id="show-worklist" type="button" aria-pressed="false">Full list</button>
+      <button id="show-checked" type="button" aria-pressed="false">Checked off</button>
     </nav>
 
     <main id="main">
@@ -337,6 +348,14 @@ export const APP_HTML = `<!doctype html>
           <button id="refresh" class="refresh-button" type="button">Refresh</button>
         </div>
         <div id="board" class="board" aria-busy="true"></div>
+      </section>
+
+      <section id="checked-view" aria-labelledby="checked-title" hidden>
+        <div class="section-head">
+          <div><h2 id="checked-title">Checked off</h2><p id="checked-count">Recently completed cards. Undo brings one back to the board.</p></div>
+          <button id="refresh-checked" class="refresh-button" type="button">Refresh</button>
+        </div>
+        <div id="checked" class="worklist" aria-busy="true"></div>
       </section>
 
       <section id="worklist-view" aria-labelledby="worklist-title" hidden>
@@ -377,6 +396,15 @@ export const APP_HTML = `<!doctype html>
     </article>
   </template>
 
+  <dialog id="thread-dialog">
+    <div class="dialog-body thread-body">
+      <h2 id="thread-title">Source email</h2>
+      <p id="thread-mailbox" class="sync-line"></p>
+      <div id="thread-messages"></div>
+      <div class="dialog-actions"><button class="dialog-action" type="button" id="thread-close">Close</button></div>
+    </div>
+  </dialog>
+
   <dialog id="note-dialog">
     <form id="note-form" class="dialog-body" method="dialog">
       <h2>Add a note</h2>
@@ -410,6 +438,15 @@ export const APP_HTML = `<!doctype html>
     const worklistFilter = document.querySelector('#worklist-filter');
     const worklistCount = document.querySelector('#worklist-count');
     let worklistItems = [];
+    const showCheckedButton = document.querySelector('#show-checked');
+    const checkedView = document.querySelector('#checked-view');
+    const checkedList = document.querySelector('#checked');
+    const checkedCount = document.querySelector('#checked-count');
+    let boardItems = [];
+    const threadDialog = document.querySelector('#thread-dialog');
+    const threadMessages = document.querySelector('#thread-messages');
+    const threadTitle = document.querySelector('#thread-title');
+    const threadMailbox = document.querySelector('#thread-mailbox');
     let noteItem = null;
     let toastTimer = null;
     let activeView = 'board';
@@ -446,7 +483,7 @@ export const APP_HTML = `<!doctype html>
       document.querySelector('#urgent-count').textContent = String(open.filter(isUrgent).length);
       document.querySelector('#assigned-count').textContent = String(open.filter(function (item) { return Boolean(item.assignee); }).length);
 
-      if (!items.length) {
+      if (!open.length) {
         const empty = document.createElement('div');
         empty.className = 'empty';
         const title = document.createElement('strong');
@@ -457,7 +494,9 @@ export const APP_HTML = `<!doctype html>
         board.append(empty);
       }
 
-      items.forEach(function (item, index) {
+      // Only open cards belong on the board. Checked-off rows now travel in the same snapshot
+      // so they can be undone, and they live in the Checked off tab, not here.
+      open.forEach(function (item, index) {
         const fragment = template.content.cloneNode(true);
         const card = fragment.querySelector('.card');
         card.dataset.priority = String(item.priority || 'normal').toLowerCase();
@@ -498,9 +537,16 @@ export const APP_HTML = `<!doctype html>
           submitAction(event.currentTarget, { operation: 'snooze', id: item.id, value: answer.trim() });
         });
 
+        // Opens the conversation inside the dashboard rather than linking out to the mail
+        // provider: such a link only works for whoever owns that mailbox, and the whole
+        // point is that anyone on the team can read the chain and decide who takes it.
+        // (The served HTML must not contain the provider's name — see ui.test.js.)
         const sourceLink = fragment.querySelector('[data-action="source"]');
-        if (item.source_url) { sourceLink.href = item.source_url; sourceLink.hidden = false; }
-        else { sourceLink.hidden = true; }
+        sourceLink.hidden = !item.source_url;
+        sourceLink.removeAttribute('href');
+        sourceLink.setAttribute('role', 'button');
+        sourceLink.tabIndex = 0;
+        sourceLink.addEventListener('click', function () { openThread(item); });
 
         fragment.querySelector('[data-action="delete"]').addEventListener('click', function (event) {
           if (!window.confirm('Delete #' + item.id + ' permanently? ' + item.title)) return;
@@ -651,17 +697,85 @@ export const APP_HTML = `<!doctype html>
       activeView = view;
       const showingTodos = view === 'todos';
       const showingWorklist = view === 'worklist';
-      const showingBoard = !showingTodos && !showingWorklist;
+      const showingChecked = view === 'checked';
+      const showingBoard = !showingTodos && !showingWorklist && !showingChecked;
       boardView.hidden = !showingBoard;
       boardSummary.hidden = !showingBoard;
       todoView.hidden = !showingTodos;
       worklistView.hidden = !showingWorklist;
+      checkedView.hidden = !showingChecked;
       showBoardButton.setAttribute('aria-pressed', String(showingBoard));
       showTodosButton.setAttribute('aria-pressed', String(showingTodos));
       showWorklistButton.setAttribute('aria-pressed', String(showingWorklist));
+      showCheckedButton.setAttribute('aria-pressed', String(showingChecked));
       if (showingTodos) loadTodos();
       else if (showingWorklist) loadWorklist();
       else loadBoard();
+    }
+
+    async function openThread(item) {
+      threadTitle.textContent = '#' + item.id + ' · ' + item.title;
+      threadMailbox.textContent = 'Loading the conversation…';
+      threadMessages.replaceChildren();
+      threadDialog.showModal();
+      try {
+        const response = await fetch('/api/thread?id=' + encodeURIComponent(item.id), {
+          headers: { accept: 'application/json' }, cache: 'no-store',
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Could not load the email');
+        threadMailbox.textContent = (payload.mailbox ? 'Mailbox: ' + payload.mailbox + ' · ' : '') +
+          payload.messages.length + ' message' + (payload.messages.length === 1 ? '' : 's');
+        payload.messages.forEach(function (message) {
+          const block = document.createElement('div');
+          block.className = 'thread-message';
+          const meta = document.createElement('span');
+          meta.className = 'thread-meta';
+          meta.textContent = [message.from, message.date].filter(Boolean).join(' · ');
+          const text = document.createElement('div');
+          text.className = 'thread-text';
+          text.textContent = message.body || '(no text in this message)';
+          block.append(meta, text);
+          if (message.truncated) {
+            const note = document.createElement('div');
+            note.className = 'thread-truncated';
+            note.textContent = 'Message shortened — the rest is in the original mailbox.';
+            block.append(note);
+          }
+          threadMessages.append(block);
+        });
+      } catch (error) {
+        threadMailbox.textContent = error.message || 'Could not load the email';
+      }
+    }
+
+    function renderChecked() {
+      const done = boardItems.filter(function (item) { return item.status === 'done'; });
+      checkedList.replaceChildren();
+      done.forEach(function (item) {
+        const row = document.createElement('div');
+        row.className = 'checked-row';
+        const text = document.createElement('span');
+        text.className = 'worklist-text';
+        text.textContent = '#' + item.id + ' · ' + item.title;
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'card-action';
+        undo.textContent = 'Undo';
+        undo.addEventListener('click', function (event) {
+          submitAction(event.currentTarget, { operation: 'reopen', id: item.id }, function () {
+            item.status = 'open';
+            row.remove();
+            renderChecked();
+          });
+        });
+        row.append(text, undo);
+        checkedList.append(row);
+      });
+      checkedCount.textContent = done.length
+        ? done.length + ' recently checked off · Undo brings one back to the board'
+        : 'Nothing checked off in the last 7 days.';
+      checkedList.setAttribute('aria-busy', 'false');
     }
 
     function renderWorklist() {
@@ -717,7 +831,9 @@ export const APP_HTML = `<!doctype html>
         if (!response.ok) throw new Error('Board request failed (' + response.status + ')');
         const payload = await response.json();
         setFreshness(payload);
-        render(Array.isArray(payload.items) ? payload.items : []);
+        boardItems = Array.isArray(payload.items) ? payload.items : [];
+        render(boardItems);
+        renderChecked();
       } catch (error) {
         stateBadge.className = 'state-badge offline';
         stateBadge.textContent = 'Unavailable';
@@ -770,10 +886,13 @@ export const APP_HTML = `<!doctype html>
       noteItem = null;
     });
     document.querySelector('#note-cancel').addEventListener('click', function () { noteDialog.close(); noteItem = null; });
+    document.querySelector('#thread-close').addEventListener('click', function () { threadDialog.close(); });
     document.querySelector('#refresh').addEventListener('click', loadBoard);
     document.querySelector('#refresh-worklist').addEventListener('click', loadWorklist);
     worklistFilter.addEventListener('input', renderWorklist);
     showWorklistButton.addEventListener('click', function () { switchView('worklist'); });
+    showCheckedButton.addEventListener('click', function () { switchView('checked'); });
+    document.querySelector('#refresh-checked').addEventListener('click', loadBoard);
     document.querySelector('#refresh-todos').addEventListener('click', loadTodos);
     document.querySelector('#add-todo').addEventListener('click', function () {
       const text = window.prompt('What needs to be done?');
@@ -794,7 +913,7 @@ export const APP_HTML = `<!doctype html>
     window.setInterval(function () {
       if (activeView === 'todos') loadTodos();
       else if (activeView === 'worklist') loadWorklist();
-      else loadBoard();
+      else loadBoard();  // also refreshes the checked-off list, which shares the snapshot
     }, 30000);
   </script>
 </body>

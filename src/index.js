@@ -21,8 +21,8 @@ import { APP_HTML } from './ui.js'
 
 const UI_HOST = 'aries.flood.doctor'
 const SYNC_HOST = 'aries-publish.flood.doctor'
-const UI_PATHS = new Set(['/', '/api/board', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist'])
-const SYNC_PATH = /^\/api\/sync\/(?:snapshot|worklist|commands(?:\/\d+\/ack)?|todos\/(?:catalogue|operations|state))$/
+const UI_PATHS = new Set(['/', '/api/board', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist', '/api/thread'])
+const SYNC_PATH = /^\/api\/sync\/(?:snapshot|worklist|threads|commands(?:\/\d+\/ack)?|todos\/(?:catalogue|operations|state))$/
 const MAX_ITEMS = 1000
 const MAX_SNAPSHOT_BYTES = 1_800_000
 const MAX_TODO_BYTES = 1_800_000
@@ -74,8 +74,11 @@ const STRING_LIMITS = Object.freeze({
 // Teammates the board can be assigned to. An assignment is applied by Aries, so this list
 // only has to agree with the roster team-tools.sh accepts.
 const BOARD_ASSIGNEES = Object.freeze(['frank', 'mark', 'dom', 'steve', 'shayan', 'katherine', 'aries'])
-const BOARD_OPERATIONS = Object.freeze(['done', 'note', 'assign', 'snooze', 'reorder', 'delete'])
+const BOARD_OPERATIONS = Object.freeze(['done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete'])
 const MAX_WORKLIST_ITEMS = 1000
+const MAX_THREADS = 60
+const MAX_THREAD_MESSAGES = 20
+const THREAD_STRING_LIMITS = Object.freeze({ from: 300, to: 300, date: 300, subject: 300, body: 4000 })
 const WORKLIST_STRING_LIMITS = Object.freeze({
   text: 2000,
   who: 160,
@@ -632,6 +635,98 @@ async function publishSnapshot(request, env) {
       published_at = excluded.published_at
   `).bind(snapshotJson, publishedAt).run()
   return json({ ok: true, published_at: publishedAt, item_count: snapshot.items.length })
+}
+
+/**
+ * The source email conversation behind a board row. Published by Aries because only the
+ * domain service account can read every mailbox; the point is that a teammate can read a
+ * thread that lives in someone else's inbox and decide whether to take the work.
+ * @param {unknown} payload
+ * @returns {{threads: JsonObject[]}|null}
+ */
+function curateThreads(payload) {
+  if (!isObject(payload)) return null
+  const source = /** @type {Record<string, unknown>} */ (payload)
+  if (!Array.isArray(source.threads) || source.threads.length > MAX_THREADS) return null
+  /** @type {JsonObject[]} */
+  const threads = []
+  const seen = new Set()
+  for (const raw of source.threads) {
+    if (!isObject(raw)) return null
+    const thread = /** @type {Record<string, unknown>} */ (raw)
+    if (!Number.isSafeInteger(thread.item_id) || /** @type {number} */ (thread.item_id) <= 0) return null
+    if (seen.has(thread.item_id)) return null
+    if (!Array.isArray(thread.messages) || !thread.messages.length) return null
+    if (thread.messages.length > MAX_THREAD_MESSAGES) return null
+    /** @type {JsonObject[]} */
+    const messages = []
+    for (const rawMessage of thread.messages) {
+      if (!isObject(rawMessage)) return null
+      const message = /** @type {Record<string, unknown>} */ (rawMessage)
+      /** @type {JsonObject} */
+      const curated = {}
+      for (const [field, limit] of Object.entries(THREAD_STRING_LIMITS)) {
+        const value = message[field]
+        if (value === undefined || value === null) continue
+        if (typeof value !== 'string' || value.length > limit) return null
+        curated[field] = value
+      }
+      curated.truncated = message.truncated === true
+      messages.push(curated)
+    }
+    const subject = typeof thread.subject === 'string' ? thread.subject.slice(0, THREAD_STRING_LIMITS.subject) : ''
+    const mailbox = typeof thread.mailbox === 'string' ? thread.mailbox.slice(0, 240) : ''
+    seen.add(thread.item_id)
+    threads.push({ item_id: thread.item_id, subject, mailbox, messages })
+  }
+  return { threads }
+}
+
+/**
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {Promise<Response>}
+ */
+async function publishThreads(request, env) {
+  if (request.method !== 'POST') return methodNotAllowed('POST')
+  if (!hasJsonContentType(request)) return unsupportedMediaType()
+  const curated = curateThreads(await readJson(request))
+  if (!curated) return badRequest('Invalid threads')
+  const publishedAt = new Date().toISOString()
+  // Replaced wholesale: a row that leaves the board must not leave its email behind.
+  const statements = [env.DB.prepare('DELETE FROM board_threads')]
+  for (const thread of curated.threads) {
+    statements.push(env.DB.prepare(`
+      INSERT INTO board_threads (item_id, thread_json, published_at) VALUES (?, ?, ?)
+    `).bind(thread.item_id, JSON.stringify(thread), publishedAt))
+  }
+  await env.DB.batch(statements)
+  return json({ ok: true, published_at: publishedAt, thread_count: curated.threads.length })
+}
+
+/**
+ * @param {Request} request
+ * @param {Env} env
+ * @param {URL} url
+ * @returns {Promise<Response>}
+ */
+async function getThread(request, env, url) {
+  if (request.method !== 'GET') return methodNotAllowed('GET')
+  const raw = url.searchParams.get('id')
+  if (!raw || !/^\d+$/.test(raw)) return badRequest('Invalid item id')
+  const itemId = Number(raw)
+  if (!Number.isSafeInteger(itemId) || itemId <= 0) return badRequest('Invalid item id')
+  const row = await env.DB.prepare(`
+    SELECT thread_json, published_at FROM board_threads WHERE item_id = ?
+  `).bind(itemId).first()
+  if (!row) return json({ error: 'No source email for this item' }, 404)
+  let thread
+  try {
+    thread = JSON.parse(/** @type {string} */ (row.thread_json))
+  } catch {
+    return json({ error: 'Thread unavailable' }, 503)
+  }
+  return json({ ...thread, published_at: row.published_at })
 }
 
 /**
@@ -1235,6 +1330,7 @@ export async function handleRequest(request, env) {
     if (url.pathname === '/api/action') return queueAction(request, env, actorEmail)
     if (url.pathname === '/api/todos') return getTodos(request, env)
     if (url.pathname === '/api/worklist') return getWorklist(request, env)
+    if (url.pathname === '/api/thread') return getThread(request, env, url)
     if (url.pathname === '/api/todo/action') return saveTodoAction(request, env, actorEmail)
     return notFound()
   }
@@ -1243,6 +1339,7 @@ export async function handleRequest(request, env) {
   if (!(await validPublisher(request, env))) return unauthorized()
   if (url.pathname === '/api/sync/snapshot') return publishSnapshot(request, env)
   if (url.pathname === '/api/sync/worklist') return publishWorklist(request, env)
+  if (url.pathname === '/api/sync/threads') return publishThreads(request, env)
   if (url.pathname === '/api/sync/commands') return listCommands(request, env, url)
   if (url.pathname === '/api/sync/todos/catalogue') return publishTodoCatalogue(request, env)
   if (url.pathname === '/api/sync/todos/operations') return publishTodoOperations(request, env)

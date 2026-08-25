@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS board_snapshot (
 CREATE TABLE IF NOT EXISTS command_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   operation TEXT NOT NULL CHECK (
-    operation IN ('done', 'note', 'assign', 'snooze', 'reorder', 'delete')
+    operation IN ('done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete')
   ),
   item_id INTEGER NOT NULL CHECK (item_id > 0),
   note TEXT,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS command_queue (
   CHECK (
     (operation IN ('assign', 'snooze', 'reorder') AND value IS NOT NULL AND length(value) <= 240)
     OR
-    (operation IN ('done', 'note', 'delete') AND value IS NULL)
+    (operation IN ('done', 'reopen', 'note', 'delete') AND value IS NULL)
   )
 );
 
@@ -66,5 +66,14 @@ CREATE INDEX IF NOT EXISTS todo_operations_item_idx
 CREATE TABLE IF NOT EXISTS worklist_snapshot (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
   worklist_json TEXT NOT NULL,
+  published_at TEXT NOT NULL
+);
+
+-- The source email conversation behind a board row. Published by Aries with the domain
+-- service account so any authenticated teammate can read the chain, not just whoever owns
+-- the mailbox it lives in. Read-only; replaced wholesale on each publish.
+CREATE TABLE IF NOT EXISTS board_threads (
+  item_id INTEGER PRIMARY KEY CHECK (item_id > 0),
+  thread_json TEXT NOT NULL,
   published_at TEXT NOT NULL
 );

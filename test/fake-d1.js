@@ -29,6 +29,9 @@ class FakeD1Statement {
     let row = null
     if (this.query.includes('from board_snapshot')) {
       row = this.database.snapshot ? { ...this.database.snapshot } : null
+    } else if (this.query.includes('from board_threads')) {
+      row = this.database.threads.get(Number(this.values[0])) || null
+      row = row ? { ...row } : null
     } else if (this.query.includes('from worklist_snapshot')) {
       row = this.database.worklist ? { ...this.database.worklist } : null
     } else if (this.query.includes('from todo_catalogue')) {
@@ -82,6 +85,17 @@ class FakeD1Statement {
     if (this.query.startsWith('insert into board_snapshot')) {
       const [snapshot_json, published_at] = this.values
       this.database.snapshot = { snapshot_json, published_at }
+      return result([], 1, 1)
+    }
+
+    if (this.query.startsWith('delete from board_threads')) {
+      this.database.threads.clear()
+      return result([], 1, 0)
+    }
+
+    if (this.query.startsWith('insert into board_threads')) {
+      const [item_id, thread_json, published_at] = this.values
+      this.database.threads.set(Number(item_id), { item_id, thread_json, published_at })
       return result([], 1, 1)
     }
 
@@ -155,6 +169,7 @@ export class FakeD1Database {
   constructor() {
     this.snapshot = null
     this.worklist = null
+    this.threads = new Map()
     this.commands = []
     this.nextCommandId = 1
     this.todoCatalogue = null

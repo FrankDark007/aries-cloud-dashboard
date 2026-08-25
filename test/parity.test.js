@@ -61,6 +61,7 @@ test('queues every operation the local board supports, with its argument', async
     { body: { operation: 'snooze', id: 13, value: '2026-09-01' }, value: '2026-09-01' },
     { body: { operation: 'reorder', id: 14, value: 3 }, value: '3' },
     { body: { operation: 'delete', id: 15 }, value: null },
+    { body: { operation: 'reopen', id: 16 }, value: null },
   ]
 
   for (const { body, value } of cases) {
@@ -144,4 +145,101 @@ test('the full working list is not readable without an Access identity', async (
   const anonymous = new Request(`https://${UI_HOST}/api/worklist`)
   const response = await worker.fetch(anonymous, env, {})
   assert.equal(response.status, 403)
+})
+
+test('a checked-off card can be brought back, and reopen takes no argument', async () => {
+  const db = new FakeD1Database()
+  const env = settings(db)
+
+  // Undo after a mis-click. The queue is what Aries reads, so the reopen has to survive
+  // exactly as issued — no note, no value, just the item.
+  const undo = await worker.fetch(action({ operation: 'reopen', id: 41 }), env, {})
+  assert.equal(undo.status, 202)
+  const queued = await worker.fetch(
+    new Request(`https://${SYNC_HOST}/api/sync/commands?limit=10`, {
+      headers: { authorization: 'Bearer test-publisher-token' },
+    }), env, {})
+  const payload = await queued.json()
+  assert.equal(payload.commands.length, 1)
+  assert.equal(payload.commands[0].operation, 'reopen')
+  assert.equal(payload.commands[0].item_id, 41)
+  assert.equal(payload.commands[0].note, null)
+  assert.equal(payload.commands[0].value, null)
+
+  // An argument on reopen is meaningless; accepting one would let a caller smuggle state
+  // past the queue's CHECK constraints.
+  const withValue = await worker.fetch(action({ operation: 'reopen', id: 42, value: 'open' }), env, {})
+  assert.equal(withValue.status, 202)
+  const after = await worker.fetch(
+    new Request(`https://${SYNC_HOST}/api/sync/commands?limit=10`, {
+      headers: { authorization: 'Bearer test-publisher-token' },
+    }), env, {})
+  const rows = (await after.json()).commands
+  assert.equal(rows[1].value, null, 'reopen must never carry a value')
+})
+
+test('a checked-off card is published so it can be undone, but stays off the open board', async () => {
+  const db = new FakeD1Database()
+  const env = settings(db)
+  const published = await worker.fetch(publish('/api/sync/snapshot', {
+    items: [
+      { id: 51, title: 'Still to do', status: 'open' },
+      { id: 52, title: 'Checked off by mistake', status: 'done' },
+    ],
+  }), env, {})
+  assert.equal(published.status, 200)
+
+  const board = await worker.fetch(read('/api/board'), env, {})
+  const items = (await board.json()).items
+  assert.equal(items.length, 2, 'both travel in the snapshot')
+  assert.equal(items.filter((item) => item.status === 'done').length, 1, 'the done one is available to undo')
+})
+
+test('serves a source email chain to any teammate, whichever mailbox it lives in', async () => {
+  const db = new FakeD1Database()
+  const env = settings(db)
+
+  const published = await worker.fetch(publish('/api/sync/threads', {
+    threads: [{
+      item_id: 61,
+      subject: 'Re: claim 00300123752',
+      mailbox: 'steve@restorationdoctors.com',
+      messages: [
+        { from: 'adjuster@carrier.com', to: 'steve@restorationdoctors.com', date: 'Mon, 24 Aug 2026 09:00:00 -0400', body: 'Please send the invoice.', truncated: false },
+        { from: 'steve@restorationdoctors.com', to: 'adjuster@carrier.com', date: 'Mon, 24 Aug 2026 09:30:00 -0400', body: 'Attached.', truncated: false },
+      ],
+    }],
+  }), env, {})
+  assert.equal(published.status, 200)
+  assert.equal((await published.json()).thread_count, 1)
+
+  // Mark owns none of those mailboxes; he must still be able to read the chain.
+  const asMark = await worker.fetch(read('/api/thread?id=61', 'mark@flood.doctor'), env, {})
+  assert.equal(asMark.status, 200)
+  const thread = await asMark.json()
+  assert.equal(thread.mailbox, 'steve@restorationdoctors.com')
+  assert.equal(thread.messages.length, 2)
+  assert.equal(thread.messages[0].body, 'Please send the invoice.')
+
+  const missing = await worker.fetch(read('/api/thread?id=62', 'mark@flood.doctor'), env, {})
+  assert.equal(missing.status, 404)
+
+  const anonymous = await worker.fetch(new Request(`https://${UI_HOST}/api/thread?id=61`), env, {})
+  assert.equal(anonymous.status, 403, 'an email chain must never be readable without an identity')
+})
+
+test('refuses an oversized or malformed thread rather than storing part of it', async () => {
+  const db = new FakeD1Database()
+  const env = settings(db)
+  const refusals = [
+    { threads: [{ item_id: 0, messages: [{ body: 'x' }] }] },
+    { threads: [{ item_id: 71, messages: [] }] },
+    { threads: [{ item_id: 72, messages: [{ body: 'x'.repeat(4001) }] }] },
+    { threads: [{ item_id: 73, messages: Array.from({ length: 21 }, () => ({ body: 'x' })) }] },
+    { threads: [{ item_id: 74, messages: [{ body: 'ok' }] }, { item_id: 74, messages: [{ body: 'dupe' }] }] },
+  ]
+  for (const body of refusals) {
+    const response = await worker.fetch(publish('/api/sync/threads', body), env, {})
+    assert.equal(response.status, 400, JSON.stringify(body).slice(0, 60))
+  }
 })
