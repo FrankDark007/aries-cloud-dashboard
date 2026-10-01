@@ -25,3 +25,13 @@ Worker rollback: `npx wrangler rollback 8fd6600b-427e-4967-8218-fa766889ca00` fr
 
 Schema undo, after Worker rollback: `DROP TABLE IF EXISTS mission_answers;`
 Apply only to the new table. Existing Mission records remain untouched.
+
+## C34, 10/01/2026
+
+Previous live Worker version: `ccbc5a43-7b77-4672-9c49-d4e2fbd8679d`.
+
+Worker rollback: `npx wrangler rollback ccbc5a43-7b77-4672-9c49-d4e2fbd8679d` from `/Users/ghost/Projects/aries-cloud-dashboard`.
+
+Schema undo, only after Worker rollback: `ALTER TABLE mission_answers DROP COLUMN received_by;`
+The additive column may safely remain after rollback. Answer rows and receipt times remain untouched.
+Hook undo: restore the settings backup named in the C34 handoff.

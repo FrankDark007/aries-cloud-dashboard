@@ -58,17 +58,19 @@ async function answerRequest(request, env, actor) {
     let body
     try { body=await request.json() } catch {return response({error:'Invalid JSON'},400)}
     if (!body || !['new','all'].includes(body.mode)) return response({error:'Invalid mode'},400)
+    const by=body.by==null?'mission-poller':body.by
+    if (typeof by!=='string' || !/^[\w.:@-]{1,160}$/.test(by)) return response({error:'Invalid session tag'},400)
     // One SQLite statement claims the entire pending set. No read-before-write race.
     const rows=body.mode==='new'
-      ? await env.DB.prepare('UPDATE mission_answers SET received=? WHERE received IS NULL RETURNING id,card_id,kind,choice,text,created,author').bind(new Date().toISOString()).all()
-      : await env.DB.prepare('SELECT id,card_id,kind,choice,text,created,author FROM mission_answers ORDER BY id').all()
-    return response({answers:rows.results.sort((/** @type {any} */ a,/** @type {any} */ b)=>a.id-b.id)})
+      ? await env.DB.prepare('UPDATE mission_answers SET received=?,received_by=? WHERE received IS NULL RETURNING id,card_id,kind,choice,text,created,author,received,received_by').bind(new Date().toISOString(),by).all()
+      : await env.DB.prepare('SELECT id,card_id,kind,choice,text,created,author,received,received_by FROM mission_answers ORDER BY id').all()
+    return response({answers:rows.results.map((/** @type {any} */ row)=>({...row,by:row.received_by})).sort((/** @type {any} */ a,/** @type {any} */ b)=>a.id-b.id)})
   }
   if (url.hostname !== 'aries.flood.doctor') return response({error:'Not found'},404)
   if (typeof actor !== 'string' || !actor) return response({error:'Unauthorized'},401)
   if (url.pathname === '/api/mission/answers') {
     if (request.method !== 'GET') return response({error:'Method not allowed'},405)
-    const rows=await env.DB.prepare('SELECT id,card_id,kind,choice,text,created,received FROM mission_answers WHERE author=? ORDER BY id').bind(actor).all()
+    const rows=await env.DB.prepare('SELECT id,card_id,kind,choice,text,created,received,received_by FROM mission_answers WHERE author=? ORDER BY id').bind(actor).all()
     return response({answers:rows.results})
   }
   if (request.method !== 'POST') return response({error:'Method not allowed'},405)
@@ -88,7 +90,7 @@ async function answerRequest(request, env, actor) {
     const rows=await env.DB.prepare(`INSERT INTO mission_answers(card_id,kind,choice,created,author)
       VALUES(?,'choice',?,?,?) ON CONFLICT(card_id,author) WHERE kind='choice'
       DO UPDATE SET choice=excluded.choice,created=excluded.created WHERE mission_answers.received IS NULL
-      RETURNING id,card_id,kind,choice,text,created,received`).bind(body.card_id,body.choice,now,actor).all()
+      RETURNING id,card_id,kind,choice,text,created,received,received_by`).bind(body.card_id,body.choice,now,actor).all()
     if (!rows.results.length) return response({error:'Received. Use Your instructions to change your choice.'},409)
     return response({answer:rows.results[0]})
   }
@@ -97,7 +99,7 @@ async function answerRequest(request, env, actor) {
   if (typeof body.request_id!=='string' || !/^[\w-]{1,100}$/.test(body.request_id)) return response({error:'Invalid request id'},400)
   const rows=await env.DB.prepare(`INSERT INTO mission_answers(card_id,kind,text,created,author,request_id)
     VALUES(?,'text',?,?,?,?) ON CONFLICT(author,request_id) DO UPDATE SET request_id=excluded.request_id
-    RETURNING id,card_id,kind,choice,text,created,received`).bind(body.card_id,body.text,now,actor,body.request_id).all()
+    RETURNING id,card_id,kind,choice,text,created,received,received_by`).bind(body.card_id,body.text,now,actor,body.request_id).all()
   return response({answer:rows.results[0]})
 }
 /** @param {any} env */

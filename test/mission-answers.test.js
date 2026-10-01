@@ -11,12 +11,13 @@ function fixture() {
   const db=new DatabaseSync(':memory:')
   db.exec(readFileSync(new URL('../migrations/0010_mission.sql',import.meta.url),'utf8'))
   db.exec(readFileSync(new URL('../migrations/0011_mission_answers.sql',import.meta.url),'utf8'))
+  db.exec(readFileSync(new URL('../migrations/0012_mission_answers_by.sql',import.meta.url),'utf8'))
   db.prepare('INSERT INTO mission_records VALUES(?,?,?,?)').run('decision','TEST-C33',JSON.stringify({options:'Later,Review (recommended)'}),'2026-10-01T10:00:00Z')
   db.prepare('INSERT INTO mission_records VALUES(?,?,?,?)').run('task','TEST-task',JSON.stringify({status:'running'}),'2026-10-01T10:00:00Z')
   const env={MISSION_TOKEN:'TEST-only',ALLOWED_EMAILS:'frank@example.test',ALLOWED_EMAIL_DOMAINS:'flood.doctor',DB:{prepare(sql){return {values:[],bind(...values){this.values=values;return this},async all(){return {results:db.prepare(sql).all(...this.values)}},async first(){return db.prepare(sql).get(...this.values)}}}}}
   const call=(path,body,headers={},method=body===undefined?'GET':'POST',host='aries.flood.doctor')=>worker.fetch(new Request('https://'+host+path,{method,headers:{'Cf-Access-Authenticated-User-Email':'frank@example.test',Origin:'https://aries.flood.doctor','Content-Type':'application/json',...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}),env,{})
   const answer=(body,headers={})=>call('/api/mission/answer',{card_id:'TEST-C33',...body},headers)
-  const poll=mode=>call('/api/mission/answers',{mode},{Authorization:'Bearer TEST-only'},'POST','aries-publish.flood.doctor')
+  const poll=(mode,by='TEST-session')=>call('/api/mission/answers',{mode,by},{Authorization:'Bearer TEST-only'},'POST','aries-publish.flood.doctor')
   return {db,call,answer,poll}
 }
 for (const [name,value] of Object.entries({comma:'Later,Review (recommended)',or:'Later or Review (recommended)',semicolon:'Later;Review (recommended)',newline:'Later\nReview (recommended)',array:['Later','Review (recommended)']})) {
@@ -88,4 +89,32 @@ test('Mission script parses and includes accessible card controls and retained d
   const script=MISSION_HTML.match(/<script>([\s\S]*?)<\/script>/)[1]
   assert.doesNotThrow(()=>new Function(script))
   for(const text of ['aria-pressed','Your instructions','aria-live="polite"','font:16px','min-height:48px','sessionStorage.missionDrafts','AbortSignal.timeout(20000)','Received. Use Your instructions'])assert.ok(MISSION_HTML.includes(text),text)
+})
+
+test('receipt records winning session and all and own reads retain it',async()=>{
+  const f=fixture();await f.answer({kind:'choice',choice:'Later'})
+  const replies=await Promise.all([f.poll('new','TEST-one'),f.poll('new','TEST-two')])
+  const rows=(await Promise.all(replies.map(r=>r.json()))).flatMap(r=>r.answers)
+  assert.equal(rows.length,1);assert.ok(['TEST-one','TEST-two'].includes(rows[0].by))
+  assert.equal(rows[0].received_by,rows[0].by);assert.ok(rows[0].received)
+  assert.equal((await (await f.poll('all')).json()).answers[0].by,rows[0].by)
+  assert.equal((await (await f.call('/api/mission/answers')).json()).answers[0].received_by,rows[0].by)
+  assert.equal((await f.poll('new','bad\ncontext')).status,400)
+})
+
+test('answer states use Eastern clocks, warn at exactly 15 minutes, and clear on receipt',()=>{
+  const script=MISSION_HTML.match(/<script>([\s\S]*?)<\/script>/)[1]
+  const start=script.indexOf('function answerStatus('),end=script.indexOf('let records=',start)
+  const render=new Function('esc','mins',script.slice(start,end)+';return answerStatus')
+  const now=Date.parse('2026-10-01T15:35:00Z')
+  const status=render(x=>String(x).replace(/</g,'&lt;'),s=>Math.floor((now-Date.parse(s))/60000))
+  const a={created:'2026-10-01T15:21:00Z'}
+  assert.equal(status(a),'Sent 11:21 AM, waiting for a session')
+  a.created='2026-10-01T15:20:00Z'
+  assert.match(status(a),/class="w warn".*Not read yet, sent 15 minutes ago. No session has picked it up./)
+  a.created='2026-10-01T15:19:00Z';assert.match(status(a),/sent 16 minutes ago/)
+  a.received='2026-10-01T15:35:00Z';a.received_by='TEST-session'
+  assert.equal(status(a),'Received by <code class="session-tag">TEST-session</code> at 11:35 AM ET')
+  assert.doesNotMatch(status(a),/warn|Not read/)
+  a.received_by='<script>';assert.match(status(a),/&lt;script>/)
 })
