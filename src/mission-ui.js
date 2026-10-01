@@ -61,7 +61,7 @@ const MKR={run:'\u{1F7E1}',done:'\u{1F7E2}',bad:'⚠️',ask:'\u{1F534}',stop:'�
 let records=[],todos=[],todoErr=false,showDone=false,showAllAsks=false,loaded=false;const open=new Set();
 const num=s=>{const m=/(\d+(?:\.\d+)?)/.exec(String(s==null?'':s));return m?Math.min(100,+m[1]):null};
 function bar(label,v){if(v==null)return'<div class="bar"><span>'+label+'</span><i></i><em>n/a</em></div>';return'<div class="bar"><span>'+label+'</span><i><b class="'+(v>=90?'hi':'')+'" style="width:'+v+'%"></b></i><em>'+Math.round(v)+'%</em></div>'}
-function taskInfo(r){const d=r.data,t=d.status_source?d.source_updated:r.updated,m=mins(t);let k,word,cls;
+function taskInfo(r){const d=r.data,t=d.activity_updated||(d.status_source?d.source_updated:r.updated),m=mins(t);let k,word,cls;
 if(d.status==='running'){if(m!=null&&m>40){k='bad';word='Stuck: no news for '+dur(m);cls='bad'}else{k='run';word='Running';cls='warn'}}
 else if(d.status==='failed'){k='bad';word='Failed';cls='bad'}else if(d.status==='waiting'){k='run';word='Waiting';cls='warn'}
 else if(d.status==='done'){k='done';word='Done';cls='ok'}else{k='stop';word='Stopped';cls='idle'}
