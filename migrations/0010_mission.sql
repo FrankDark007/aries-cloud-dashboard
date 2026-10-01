@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS mission_records (kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, updated TEXT NOT NULL, PRIMARY KEY(kind,id));

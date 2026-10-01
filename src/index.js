@@ -1,4 +1,5 @@
 import { APP_HTML } from './ui.js'
+import { missionRequest, checkServices } from './mission.js'
 
 /**
  * @typedef {object} BoardItem
@@ -1361,6 +1362,8 @@ export async function handleRequest(request, env) {
   const url = new URL(request.url)
   const host = url.hostname
 
+  if (['/mission', '/api/mission', '/api/mission/push'].includes(url.pathname)) return missionRequest(request, env, !!allowedEmail(request, env))
+
   if (host !== UI_HOST && host !== SYNC_HOST) return notFound()
   if (url.pathname === '/healthz' && request.method === 'GET') {
     return json({ ok: true })
@@ -1403,6 +1406,7 @@ export async function handleRequest(request, env) {
 
 /** @type {ExportedHandler<Env>} */
 const worker = {
+  async scheduled(event, env, ctx) { ctx.waitUntil(checkServices(env)) },
   async fetch(request, env) {
     return handleRequest(request, env)
   },

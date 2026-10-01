@@ -338,7 +338,7 @@ export const APP_HTML = `<!doctype html>
       </div>
     </header>
 
-    <nav class="view-switch" aria-label="Aries view">
+    <nav class="view-switch" aria-label="Aries view"><a href="/mission" style="padding:12px;color:inherit">Mission Control</a>
       <button id="show-board" type="button" aria-pressed="true">Board</button>
       <button id="show-todos" type="button" aria-pressed="false">To-Do</button>
       <button id="show-worklist" type="button" aria-pressed="false">Full list</button>
