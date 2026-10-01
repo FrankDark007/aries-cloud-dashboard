@@ -1406,7 +1406,7 @@ export async function handleRequest(request, env) {
 
 /** @type {ExportedHandler<Env>} */
 const worker = {
-  async scheduled(event, env, ctx) { ctx.waitUntil(checkServices(env)) },
+  async scheduled(event, env, ctx) { ctx.waitUntil(checkServices(env,'cron')) },
   async fetch(request, env) {
     return handleRequest(request, env)
   },

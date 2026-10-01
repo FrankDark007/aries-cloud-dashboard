@@ -29,7 +29,7 @@ export async function missionRequest(request, env, canRead) {
   return Response.json({now:new Date().toISOString(),records:rows.results.map(/** @param {any} r */ r=>({...r,data:JSON.parse(r.data)}))},{headers:{'cache-control':'no-store'}})
 }
 /** @param {any} env */
-export async function checkServices(env) {
+export async function checkServices(env, cause='manual') {
   const targets = [
     ['engine.flood.doctor','https://engine.flood.doctor/health'],
     ['dashboard.restorationdoctors.com','https://dashboard.restorationdoctors.com/'],
@@ -37,7 +37,9 @@ export async function checkServices(env) {
     ['crm.flood.doctor','https://crm.flood.doctor/']
   ]
   await Promise.all(targets.map(async ([host,url])=>{
-    const start=Date.now(); let data
+    const start=Date.now();
+    /** @type {{status:string,ms:number,detail:string,checked_by?:string}} */
+    let data
     /** @type {Record<string,string>} */
     const headers = host==='engine.flood.doctor' ? {'CF-Access-Client-Id':env.ENGINE_ACCESS_ID,'CF-Access-Client-Secret':env.ENGINE_ACCESS_SECRET} : {}
     try {
@@ -46,6 +48,7 @@ export async function checkServices(env) {
       const gate=r.status>=300&&r.status<400 || /cloudflare access|sign in.*cloudflare/i.test(text)
       data={status:gate?'waiting':r.ok?'up':'down',ms:Date.now()-start,detail:gate?'Login gate answered; service health unknown':host==='aries.flood.doctor'?'Worker health check · HTTP '+r.status:'HTTP '+r.status+(url.endsWith('/')?' · homepage response':' · health check')}
     } catch {data={status:'down',ms:Date.now()-start,detail:'No response'}}
+    data.checked_by=cause
     await env.DB.prepare('INSERT INTO mission_records VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated').bind('service',host,JSON.stringify(data),new Date().toISOString()).run()
   }))
 }
