@@ -92,7 +92,7 @@ const MAX_PAST_EMAILS = 10
 // Frank signs in with an address that is not his company one.
 const SIGN_IN_ALIASES = Object.freeze({ 'darakhshan.farough@gmail.com': 'frank' })
 // Who may change the To-Do list, by key, so a changed email keeps working.
-const TODO_ACTOR_KEYS = Object.freeze(['frank', 'dom', 'mark'])
+const TODO_ACTOR_KEYS = Object.freeze(['frank', 'mark'])
 // Mailboxes that show up in card history but are not people on the roster.
 const OTHER_NAMES = Object.freeze({
   'aries@flood.doctor': 'Aries',
