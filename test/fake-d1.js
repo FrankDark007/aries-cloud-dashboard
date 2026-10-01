@@ -263,7 +263,6 @@ export class FakeD1Database {
     const people = [
       ['frank', 'Frank', 'frankd@flooddoctorva.com'],
       ['mark', 'Mark', 'mark@flood.doctor'],
-      ['dom', 'Dom', 'dom@flood.doctor'],
       ['steve', 'Steve', 'steve@restorationdoctors.com'],
       ['shayan', 'Shayan', 'shyon@restorationdoctors.com'],
       ['katherine', 'Katherine', 'katherine@restorationdoctors.com'],

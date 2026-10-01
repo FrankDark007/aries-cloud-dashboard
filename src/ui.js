@@ -795,7 +795,7 @@ export const APP_HTML = `<!doctype html>
     // Frank, 09/29/2026: "I never know what each task needs or who was last to work on that
     // task or what I should do about it." Each card now answers those three in that order,
     // from the brief Aries writes out of the card's email thread and the card's own history.
-    const OWNERS = ['frank', 'mark', 'dom', 'steve', 'shayan', 'katherine'];
+    const OWNERS = ['frank', 'mark', 'steve', 'shayan', 'katherine'];
     // The roster the board sends with every refresh (key and name). A key never changes, so a
     // renamed person keeps their cards; only the name on the chips and labels moves.
     let teamList = OWNERS.map(function (key) { return { key: key, name: titleName(key) }; });

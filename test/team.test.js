@@ -64,7 +64,7 @@ test('the user list is served to the owner and is a 404 for every other identity
   const owner = await worker.fetch(as(OWNER, '/api/team'), settings(db), {})
   assert.equal(owner.status, 200)
   const body = await owner.json()
-  assert.deepEqual(body.team.map((member) => member.key), ['frank', 'mark', 'dom', 'steve', 'shayan', 'katherine'])
+  assert.deepEqual(body.team.map((member) => member.key), ['frank', 'mark', 'steve', 'shayan', 'katherine'])
   assert.equal(body.team[1].email, 'mark@flood.doctor')
 
   for (const email of ['mark@flood.doctor', 'frankd@flooddoctorva.com', 'outsider@example.com']) {
@@ -148,7 +148,7 @@ test('a bad name or address is refused with a message that says how to fix it', 
     [{ key: 'mark', name: 'Mike', email: 'mike' }, 400, /full email address/],
     [{ key: 'mark', name: 'Mike', email: 'mike@example.com' }, 400, /company address/],
     [{ key: 'mark', name: 'Mike', email: 'aries@flood.doctor' }, 400, /Aries sends from/],
-    [{ key: 'mark', name: 'Mike', email: 'dom@flood.doctor' }, 409, /Dom already uses dom@flood.doctor/],
+    [{ key: 'mark', name: 'Mike', email: 'steve@restorationdoctors.com' }, 409, /Steve already uses steve@restorationdoctors.com/],
     [{ key: 'nobody', name: 'Mike', email: 'mike@flood.doctor' }, 404, /not on the list/],
     [{ name: 'Jose', email: 'steve@restorationdoctors.com' }, 409, /Steve already uses/],
   ]
@@ -221,11 +221,11 @@ test('Aries reads the roster from the sync host with its token, and only with it
   assert.equal(onUiHost.status, 404)
 })
 
-test('before the roster table is seeded the board keeps today’s six people', async () => {
+test('before the roster table is seeded the board keeps today’s five people', async () => {
   const db = new FakeD1Database()
   db.seedSnapshot([{ id: 7, title: 'Call the carrier' }], new Date().toISOString())
   const payload = await board(db)
-  assert.deepEqual(payload.team.map((member) => member.name), ['Frank', 'Mark', 'Dom', 'Steve', 'Shayan', 'Katherine'])
+  assert.deepEqual(payload.team.map((member) => member.name), ['Frank', 'Mark', 'Steve', 'Shayan', 'Katherine'])
 })
 
 test('the page carries a User settings tab that only the owner is shown', async () => {

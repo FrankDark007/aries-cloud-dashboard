@@ -72,7 +72,6 @@ const TODO_SNAPSHOT_FIELDS = new Set([
 const DEFAULT_TEAM = Object.freeze([
   { key: 'frank', name: 'Frank', email: 'frankd@flooddoctorva.com' },
   { key: 'mark', name: 'Mark', email: 'mark@flood.doctor' },
-  { key: 'dom', name: 'Dom', email: 'dom@flood.doctor' },
   { key: 'steve', name: 'Steve', email: 'steve@restorationdoctors.com' },
   { key: 'shayan', name: 'Shayan', email: 'shyon@restorationdoctors.com' },
   { key: 'katherine', name: 'Katherine', email: 'katherine@restorationdoctors.com' },
