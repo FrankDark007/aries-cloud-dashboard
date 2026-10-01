@@ -41,7 +41,7 @@ export async function checkServices(env) {
     /** @type {Record<string,string>} */
     const headers = host==='engine.flood.doctor' ? {'CF-Access-Client-Id':env.ENGINE_ACCESS_ID,'CF-Access-Client-Secret':env.ENGINE_ACCESS_SECRET} : {}
     try {
-      const r=await fetch(url,{headers,redirect:'manual',signal:AbortSignal.timeout(10000)})
+      const r=host==='aries.flood.doctor' && env.SELF ? await env.SELF.fetch('https://aries.flood.doctor/healthz') : await fetch(url,{headers,redirect:'manual',signal:AbortSignal.timeout(10000)})
       const text=(await r.text()).slice(0,1000)
       const gate=r.status>=300&&r.status<400 || /cloudflare access|sign in.*cloudflare/i.test(text)
       data={status:gate?'waiting':r.ok?'up':'down',ms:Date.now()-start,detail:gate?'Login gate answered; service health unknown':host==='aries.flood.doctor'?'Worker health check · HTTP '+r.status:'HTTP '+r.status+(url.endsWith('/')?' · homepage response':' · health check')}
