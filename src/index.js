@@ -21,11 +21,21 @@ import { missionRequest, checkServices } from './mission.js'
 /** @typedef {{items: JsonObject[]}} TodoCatalogue */
 /** @typedef {{catalogue_json: string, published_at: string}} TodoCatalogueRow */
 /** @typedef {{id: number, operation: string, item_id: number, actor_email: string, created_at: string, state: string, acked_at: string|null}} CompletionCommand */
+/** @typedef {{key: string, name: string, email: string, past_emails: string[]}} TeamMember */
 
 const UI_HOST = 'aries.flood.doctor'
 const SYNC_HOST = 'aries-publish.flood.doctor'
 const UI_PATHS = new Set(['/', '/card', '/api/card', '/api/card/done', '/api/board', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist', '/api/thread'])
-const SYNC_PATH = /^\/api\/sync\/(?:snapshot|worklist|threads|commands(?:\/\d+\/ack)?|todos\/(?:catalogue|operations|state))$/
+// Served only to ACTIVITY_OWNER_EMAILS; every other identity gets the same 404 as a path
+// that does not exist, so staff never learn the log is there.
+const ACTIVITY_PATHS = new Set(['/activity', '/api/activity'])
+// The User settings tab reads and writes the roster here, under the same owner-only rule.
+const TEAM_PATH = '/api/team'
+const ACTIVITY_LIMIT = 1000
+// More than this many of one action by one person inside the window is flagged as a burst.
+const BURST_COUNT = 20
+const BURST_WINDOW_MS = 10 * 60 * 1000
+const SYNC_PATH = /^\/api\/sync\/(?:snapshot|worklist|threads|team|commands(?:\/\d+\/ack)?|todos\/(?:catalogue|operations|state))$/
 const MAX_ITEMS = 1000
 const MAX_SNAPSHOT_BYTES = 1_800_000
 const MAX_TODO_BYTES = 1_800_000
@@ -54,11 +64,41 @@ const TODO_SNAPSHOT_FIELDS = new Set([
   'id', 'text', 'details', 'client', 'actionType', 'notificationDate', 'sourceUrl',
   'due', 'assignee', 'attachments', 'sourceRevision', 'historyVisible',
 ])
-const ACTOR_NAMES = Object.freeze({
-  'darakhshan.farough@gmail.com': 'Frank',
-  'frankd@flooddoctorva.com': 'Frank',
-  'dom@flood.doctor': 'Dom',
-  'mark@flood.doctor': 'Mark',
+// The people on the board. Frank, 09/29/2026: "if i want to change mark's name to Mike, I dont
+// have a way to do that right now. If mark changes his email address, I want to be able to
+// update it." They live in D1 (team_users, migration 0007) and Frank edits them on the User
+// settings tab. A person's key is what cards are assigned to and never changes, so renaming
+// Mark keeps every card he owns. This list is only the fallback while the table is empty.
+const DEFAULT_TEAM = Object.freeze([
+  { key: 'frank', name: 'Frank', email: 'frankd@flooddoctorva.com' },
+  { key: 'mark', name: 'Mark', email: 'mark@flood.doctor' },
+  { key: 'dom', name: 'Dom', email: 'dom@flood.doctor' },
+  { key: 'steve', name: 'Steve', email: 'steve@restorationdoctors.com' },
+  { key: 'shayan', name: 'Shayan', email: 'shyon@restorationdoctors.com' },
+  { key: 'katherine', name: 'Katherine', email: 'katherine@restorationdoctors.com' },
+])
+// Aries only emails company addresses, and Access only signs in these three domains, so a
+// person's address has to be on one of them.
+const TEAM_DOMAINS = Object.freeze(['flood.doctor', 'flooddoctorva.com', 'restorationdoctors.com'])
+// Keys a new person never gets: Aries itself, and mailboxes Aries already knows by these names
+// (team.json on Aries keys Shayan as "shyon").
+const RESERVED_KEYS = Object.freeze(['aries', 'shyon', 'office', 'admin', 'info', 'billing', 'personal'])
+const TEAM_KEY = /^[a-z][a-z0-9]{1,23}$/
+const TEAM_EMAIL = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/
+const TEAM_NAME = /^\p{L}[\p{L}\p{M} .'-]*$/u
+const TEAM_NAME_LIMIT = 40
+const TEAM_EMAIL_LIMIT = 120
+const MAX_TEAM = 30
+const MAX_PAST_EMAILS = 10
+// Frank signs in with an address that is not his company one.
+const SIGN_IN_ALIASES = Object.freeze({ 'darakhshan.farough@gmail.com': 'frank' })
+// Who may change the To-Do list, by key, so a changed email keeps working.
+const TODO_ACTOR_KEYS = Object.freeze(['frank', 'dom', 'mark'])
+// Mailboxes that show up in card history but are not people on the roster.
+const OTHER_NAMES = Object.freeze({
+  'aries@flood.doctor': 'Aries',
+  'info@restorationdoctors.com': 'Office',
+  'dave@flooddoctorva.com': 'Dave',
 })
 const STRING_LIMITS = Object.freeze({
   title: 240,
@@ -73,17 +113,57 @@ const STRING_LIMITS = Object.freeze({
   // the worker never fetches it.
   source_url: 2048,
   snoozed_until: 80,
+  // The day the card was opened (YYYY-MM-DD), so a card can say how long it has been waiting.
+  created: 40,
+  // When someone marked the card urgent (ISO time); absent when it is not urgent.
+  urgent: 40,
 })
+// The per-card brief Aries writes from the card's email thread (bin/card-brief.py): what the
+// task needs, who is waiting, what to do next. Frank, 09/29/2026: "I never know what each task
+// needs or who was last to work on that task or what I should do about it." The shape is frozen
+// in docs/requirements-2026-09-29-better-cards.md; Aries validates the same limits before it
+// publishes.
+const BRIEF_STRING_LIMITS = Object.freeze({
+  // A short title Aries writes from the thread ("Malik: Travelers final determination, $40,859"),
+  // because a third of the cards were titled with a raw email subject. Optional: '' until the
+  // card's brief is next written, and the board cleans the subject meanwhile.
+  title: 100,
+  needs: 400,
+  next_step: 300,
+  waiting_on: 160,
+  client: 160,
+  claim: 80,
+  amount: 40,
+  deadline_note: 160,
+  phone: 40,
+})
+const BRIEF_ACTIONS = Object.freeze(['reply', 'call', 'invoice', 'payment', 'review', 'decide', 'wait', 'file', 'close'])
+// A brief's owner_hint is a roster key or '' (checked against the roster when it is curated).
+const DEFAULT_BRIEF_OWNERS = new Set([...DEFAULT_TEAM.map((member) => member.key), ''])
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/
+// What Aries is doing on a card, from bin/assign_notify.py and the owner-task queue: the prep
+// for its owner (`prep`), or the card itself when Aries owns it (`aries_task`).
+const TASK_STATES = Object.freeze(['queued', 'running', 'ready', 'failed', 'timed_out', 'interrupted', 'cancelled'])
+// The same, as the To-Do catalogue carries it for a task made from a card.
+const TODO_ARIES_PREP = Object.freeze(['queued', 'running', 'ready', 'failed'])
+const HISTORY_DAYS = 120
+const HISTORY_PER_CARD = 10
 const MAX_NOTES = 20
-// Teammates the board can be assigned to. An assignment is applied by Aries, so this list
-// only has to agree with the roster team-tools.sh accepts.
-const BOARD_ASSIGNEES = Object.freeze(['frank', 'mark', 'dom', 'steve', 'shayan', 'katherine', 'aries'])
 // `useful` / `not_useful` are the thumbs on a card. They change nothing about the task; they
 // are how the team tells Aries whether an email of that shape should have become a card at
 // all, so the next inbox sweep stops repeating a mistake. Neither takes an argument -- the
 // card already identifies the sender, and the sender is what gets learned.
+// `nudge` asks the card's owner for an update: Aries emails them and copies whoever asked.
+// Its value is the owner's name at the time, which is what the card history shows.
+// `prep` keeps the card with its teammate and has Aries do the prep work for them (Frank,
+// 09/29/2026: "assign a task to a teamate, and also assign it to aries so that aries can do some
+// prep work for that teamate"). Its value is the teammate the prep is for; migration 0008.
+// `urgent` ('on' or 'off') flags a card: it goes to the top and Aries emails whoever must act
+// (Frank, 09/29/2026: "it appears at the top and it nudges the teamates that must do something
+// asap"). Migration 0008 too.
 const BOARD_OPERATIONS = Object.freeze([
-  'done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete', 'useful', 'not_useful',
+  'done', 'reopen', 'note', 'assign', 'snooze', 'reorder', 'delete', 'useful', 'not_useful', 'nudge', 'prep',
+  'urgent',
 ])
 const MAX_WORKLIST_ITEMS = 1000
 const MAX_THREADS = 60
@@ -188,6 +268,57 @@ function allowedEmail(request, env) {
 }
 
 /**
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {boolean}
+ */
+function isActivityOwner(request, env) {
+  const email = (request.headers.get('Cf-Access-Authenticated-User-Email') || '').trim().toLowerCase()
+  if (!email || typeof env.ACTIVITY_OWNER_EMAILS !== 'string') return false
+  return env.ACTIVITY_OWNER_EMAILS.split(',').map((value) => value.trim().toLowerCase()).includes(email)
+}
+
+/**
+ * Where a write came from. Access puts the real client address in CF-Connecting-IP.
+ * @param {Request} request
+ */
+function requestOrigin(request) {
+  const cf = /** @type {{country?: string}|undefined} */ (/** @type {any} */ (request).cf)
+  return {
+    ip: request.headers.get('CF-Connecting-IP') || null,
+    country: cf && typeof cf.country === 'string' ? cf.country : null,
+    userAgent: (request.headers.get('User-Agent') || '').slice(0, 300) || null,
+  }
+}
+
+/**
+ * One audit row. The card title is resolved inside D1 from the published board or To-Do
+ * catalogue, so the worker never parses a 1.8 MB snapshot per click.
+ * @param {Env} env
+ * @param {Request} request
+ * @param {{at: string, actorEmail: string, source: 'board'|'todo', operation: string, itemId: string, value: string|null}} entry
+ */
+function activityStatement(env, request, entry) {
+  const origin = requestOrigin(request)
+  return env.DB.prepare(`
+    INSERT INTO activity_log (
+      at, actor_email, source, operation, item_id, value, title, ip, country, user_agent
+    ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+      (SELECT json_extract(j.value, '$.title')
+         FROM board_snapshot b, json_each(b.snapshot_json, '$.items') j
+        WHERE ? = 'board' AND CAST(json_extract(j.value, '$.id') AS TEXT) = ? LIMIT 1),
+      (SELECT json_extract(j.value, '$.text')
+         FROM todo_catalogue c, json_each(c.catalogue_json, '$.items') j
+        WHERE ? = 'todo' AND json_extract(j.value, '$.id') = ? LIMIT 1)
+    ), ?, ?, ?)
+  `).bind(
+    entry.at, entry.actorEmail, entry.source, entry.operation, entry.itemId, entry.value,
+    entry.source, entry.itemId, entry.source, entry.itemId,
+    origin.ip, origin.country, origin.userAgent,
+  )
+}
+
+/**
  * @param {string} left
  * @param {string} right
  * @returns {Promise<boolean>}
@@ -268,7 +399,92 @@ function curateNotes(value) {
   return notes
 }
 
-function curateItem(item) {
+/**
+ * One email event inside a brief: who wrote the latest message on one side of the thread.
+ * @param {unknown} value
+ * @returns {{by: string, at: string, what: string}|null|undefined} undefined when invalid
+ */
+function curateBriefEmail(value) {
+  if (value === null || value === undefined) return null
+  if (!isObject(value)) return undefined
+  const source = /** @type {Record<string, unknown>} */ (value)
+  const by = boundedString(source.by, 160, false)
+  const what = boundedString(source.what ?? '', 200)
+  if (by === null || what === null || !validTimestamp(source.at)) return undefined
+  return { by, at: /** @type {string} */ (source.at), what }
+}
+
+/**
+ * The brief on one card. Returns null for anything off-contract: the card then shows without
+ * its brief, and the publisher is told how many were dropped, instead of one bad brief
+ * rejecting the whole board and leaving everybody looking at a stale snapshot.
+ * @param {unknown} value
+ * @param {Set<string>} owners roster keys plus '' for no hint
+ */
+function curateBrief(value, owners) {
+  if (!isObject(value)) return null
+  const source = /** @type {Record<string, unknown>} */ (value)
+  /** @type {Record<string, unknown>} */
+  const brief = {}
+  for (const [field, limit] of Object.entries(BRIEF_STRING_LIMITS)) {
+    const text = boundedString(source[field] ?? '', limit)
+    if (text === null) return null
+    brief[field] = text
+  }
+  if (!brief.title) delete brief.title
+  if (!BRIEF_ACTIONS.includes(/** @type {string} */ (source.action))) return null
+  brief.action = source.action
+  const owner = source.owner_hint ?? ''
+  if (typeof owner !== 'string' || !owners.has(owner)) return null
+  brief.owner_hint = owner
+  for (const field of ['waiting_since', 'deadline']) {
+    const day = source[field] ?? ''
+    if (typeof day !== 'string' || (day && (!ISO_DAY.test(day) || !Number.isFinite(Date.parse(day))))) return null
+    brief[field] = day
+  }
+  if (typeof (source.counsel_only ?? false) !== 'boolean') return null
+  brief.counsel_only = source.counsel_only === true
+  for (const field of ['last_ours', 'last_theirs']) {
+    const email = curateBriefEmail(source[field])
+    if (email === undefined) return null
+    brief[field] = email
+  }
+  const messages = source.messages ?? 0
+  if (!Number.isSafeInteger(messages) || /** @type {number} */ (messages) < 0 || /** @type {number} */ (messages) > 500) return null
+  brief.messages = messages
+  if (!validTimestamp(source.generated_at)) return null
+  brief.generated_at = source.generated_at
+  return brief
+}
+
+/**
+ * One Aries task on a card. Null when off-contract, which drops only this field.
+ * @param {unknown} value
+ * @param {Set<string>} owners
+ */
+function curateTaskState(value, owners) {
+  if (!isObject(value)) return null
+  const source = /** @type {Record<string, unknown>} */ (value)
+  if (!TASK_STATES.includes(/** @type {string} */ (source.status)) || !validTimestamp(source.at)) return null
+  /** @type {Record<string, unknown>} */
+  const state = { status: source.status, at: source.at }
+  if (source.finished_at !== undefined && source.finished_at !== null) {
+    if (!validTimestamp(source.finished_at)) return null
+    state.finished_at = source.finished_at
+  }
+  if (source.for !== undefined && source.for !== null) {
+    if (typeof source.for !== 'string' || !owners.has(source.for)) return null
+    state.for = source.for
+  }
+  return state
+}
+
+/**
+ * @param {unknown} item
+ * @param {{briefsDropped: number}} [tally]
+ * @param {Set<string>} [owners] roster keys a brief may hint, plus ''
+ */
+function curateItem(item, tally, owners = DEFAULT_BRIEF_OWNERS) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return null
   const source = /** @type {Record<string, unknown>} */ (item)
   if (!Number.isSafeInteger(source.id) || /** @type {number} */ (source.id) <= 0) return null
@@ -298,14 +514,26 @@ function curateItem(item) {
     if (!notes) return null
     if (notes.length) curated.notes = notes
   }
+  if (source.brief !== undefined && source.brief !== null) {
+    const brief = curateBrief(source.brief, owners)
+    if (brief) /** @type {Record<string, unknown>} */ (curated).brief = brief
+    else if (tally) tally.briefsDropped += 1
+  }
+  for (const field of ['prep', 'aries_task']) {
+    if (source[field] === undefined || source[field] === null) continue
+    const state = curateTaskState(source[field], owners)
+    if (state) /** @type {Record<string, unknown>} */ (curated)[field] = state
+  }
   return /** @type {BoardItem} */ (curated)
 }
 
 /**
  * @param {unknown} payload
+ * @param {{briefsDropped: number}} [tally]
+ * @param {Set<string>} [owners] roster keys a brief may hint, plus ''
  * @returns {BoardSnapshot|null}
  */
-function curateSnapshot(payload) {
+function curateSnapshot(payload, tally, owners = DEFAULT_BRIEF_OWNERS) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
   const source = /** @type {Record<string, unknown>} */ (payload)
   if (!Array.isArray(source.items) || source.items.length > MAX_ITEMS) return null
@@ -313,7 +541,7 @@ function curateSnapshot(payload) {
   const items = []
   const ids = new Set()
   for (const item of source.items) {
-    const curated = curateItem(item)
+    const curated = curateItem(item, tally, owners)
     if (!curated || ids.has(curated.id)) return null
     ids.add(curated.id)
     items.push(curated)
@@ -407,6 +635,16 @@ function curateTodoItem(item) {
     if (!upstreamIds) return null
     curated.upstreamIds = upstreamIds
   }
+  // Carried from the card the task was made from: urgent sorts it to the top, and ariesPrep says
+  // what Aries is doing for its owner. Anything else in either field is ignored, not refused.
+  if (source.urgent === true) curated.urgent = true
+  if (typeof source.ariesPrep === 'string' && TODO_ARIES_PREP.includes(source.ariesPrep)) curated.ariesPrep = source.ariesPrep
+  if (curated.ariesPrep && typeof source.ariesPrepFor === 'string' && /^[a-z][a-z0-9_-]{0,39}$/.test(source.ariesPrepFor)) {
+    curated.ariesPrepFor = source.ariesPrepFor
+  }
+  // The newest change to any source card: a To-Do check-off or owner older than it has been
+  // overtaken by the board, and the board wins (replayTodos).
+  if (validTimestamp(source.sourceUpdatedAt)) curated.sourceUpdatedAt = source.sourceUpdatedAt
   return curated
 }
 
@@ -663,7 +901,8 @@ function staleAfterSeconds(env) {
 async function publishSnapshot(request, env) {
   if (request.method !== 'POST') return methodNotAllowed('POST')
   if (!hasJsonContentType(request)) return unsupportedMediaType()
-  const snapshot = curateSnapshot(await readJson(request))
+  const tally = { briefsDropped: 0 }
+  const snapshot = curateSnapshot(await readJson(request), tally, briefOwners(await loadTeam(env)))
   if (!snapshot) return badRequest('Invalid snapshot')
   const snapshotJson = JSON.stringify(snapshot)
   if (new TextEncoder().encode(snapshotJson).byteLength > MAX_SNAPSHOT_BYTES) {
@@ -677,7 +916,12 @@ async function publishSnapshot(request, env) {
       snapshot_json = excluded.snapshot_json,
       published_at = excluded.published_at
   `).bind(snapshotJson, publishedAt).run()
-  return json({ ok: true, published_at: publishedAt, item_count: snapshot.items.length })
+  return json({
+    ok: true,
+    published_at: publishedAt,
+    item_count: snapshot.items.length,
+    briefs_dropped: tally.briefsDropped,
+  })
 }
 
 /**
@@ -906,6 +1150,248 @@ async function publishTodoCatalogue(request, env) {
  * @param {Env} env
  * @returns {Promise<Response>}
  */
+/**
+ * Overlay still-queued teammate commands onto the last published snapshot.
+ *
+ * The queue is the authority for anything clicked since that publish: Aries has not seen it
+ * yet, so the snapshot still describes the old state. Without this, a card checked off
+ * seconds ago came back fully lit on the very next poll and Done read as a broken button.
+ * Applied in id order, so the last write wins.
+ *
+ * @param {any[]} items
+ * @param {any[]} commands
+ * @returns {any[]}
+ */
+function applyPendingCommands(items, commands) {
+  if (!commands.length) return items
+  const byId = new Map()
+  const order = []
+  for (const item of items) {
+    const copy = { ...item }
+    byId.set(copy.id, copy)
+    order.push(copy.id)
+  }
+  const dropped = new Set()
+  for (const command of commands) {
+    const item = byId.get(command.item_id)
+    if (!item) continue
+    if (command.operation === 'done') {
+      item.status = 'done'
+      item.pending = true
+    } else if (command.operation === 'reopen') {
+      item.status = 'open'
+      item.pending = true
+    } else if (command.operation === 'delete' || command.operation === 'not_useful') {
+      dropped.add(command.item_id)
+    } else if (command.operation === 'assign') {
+      item.assignee = command.value || ''
+      item.pending = true
+    } else if (command.operation === 'snooze') {
+      item.due = command.value || item.due
+      item.status = 'snoozed'
+      item.pending = true
+    } else if (command.operation === 'urgent') {
+      if (command.value === 'on') item.urgent = command.created_at
+      else delete item.urgent
+      item.pending = true
+    } else if (command.operation === 'note' && command.note) {
+      const notes = Array.isArray(item.notes) ? item.notes.slice() : []
+      notes.push({
+        text: command.note,
+        by: command.actor_email || '',
+        at: command.created_at || '',
+        pending: true,
+      })
+      item.notes = notes
+      item.note = command.note
+      item.pending = true
+    }
+  }
+  return order.filter((id) => !dropped.has(id)).map((id) => byId.get(id))
+}
+
+/**
+ * The roster, in board order. DEFAULT_TEAM stands in only while the table is empty.
+ * @param {Env} env
+ * @returns {Promise<TeamMember[]>}
+ */
+async function loadTeam(env) {
+  const rows = await env.DB.prepare(`
+    SELECT key, name, email, past_emails
+    FROM team_users
+    ORDER BY position, key
+  `).all()
+  /** @type {TeamMember[]} */
+  const team = []
+  for (const row of rows.results || []) {
+    /** @type {unknown} */
+    let past = []
+    try {
+      past = JSON.parse(String(row.past_emails || '[]'))
+    } catch {
+      past = []
+    }
+    team.push({
+      key: String(row.key),
+      name: String(row.name),
+      email: String(row.email),
+      past_emails: Array.isArray(past) ? past.filter((value) => typeof value === 'string') : [],
+    })
+  }
+  return team.length ? team : DEFAULT_TEAM.map((member) => ({ ...member, past_emails: [] }))
+}
+
+/** @param {TeamMember[]} team */
+function briefOwners(team) {
+  return new Set([...team.map((member) => member.key), ''])
+}
+
+/**
+ * Every name the board knows, by roster key and by address. Old addresses first, so an
+ * address that moved to someone else names its current owner.
+ * @param {TeamMember[]} team
+ * @returns {Map<string, string>}
+ */
+function teamNames(team) {
+  /** @type {Map<string, string>} */
+  const names = new Map(Object.entries(OTHER_NAMES))
+  for (const member of team) {
+    for (const address of member.past_emails) names.set(address, member.name)
+  }
+  for (const member of team) {
+    names.set(member.key, member.name)
+    names.set(member.email, member.name)
+  }
+  for (const [address, key] of Object.entries(SIGN_IN_ALIASES)) {
+    const member = team.find((candidate) => candidate.key === key)
+    if (member) names.set(address, member.name)
+  }
+  return names
+}
+
+/**
+ * The roster entry a signed-in address belongs to: its current address, then an old one.
+ * @param {TeamMember[]} team
+ * @param {string} email
+ */
+function memberFor(team, email) {
+  const address = String(email || '').trim().toLowerCase()
+  const aliased = /** @type {Record<string, string>} */ (SIGN_IN_ALIASES)[address]
+  if (aliased) return team.find((member) => member.key === aliased) || null
+  return team.find((member) => member.email === address)
+    || team.find((member) => member.past_emails.includes(address))
+    || null
+}
+
+/**
+ * A key for a new person, from their name: first name, then first and last, then numbered.
+ * @param {string} name
+ * @param {TeamMember[]} team
+ */
+function newTeamKey(name, team) {
+  const taken = new Set([...team.map((member) => member.key), ...RESERVED_KEYS])
+  const words = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .split(/[^a-z0-9]+/).filter(Boolean)
+  /** @param {string} value */
+  const clean = (value) => value.replace(/^[^a-z]+/, '').slice(0, 24)
+  const candidates = [clean(words[0] || ''), clean(words.slice(0, 2).join('')), clean(words.join(''))]
+  for (const candidate of candidates) {
+    if (TEAM_KEY.test(candidate) && !taken.has(candidate)) return candidate
+  }
+  const base = (candidates.find((candidate) => TEAM_KEY.test(candidate)) || 'user').slice(0, 21)
+  for (let number = 2; number < 1000; number += 1) {
+    if (!taken.has(`${base}${number}`)) return `${base}${number}`
+  }
+  return null
+}
+
+/**
+ * @param {string} value an address or a roster key
+ * @param {Map<string, string>} names from teamNames()
+ */
+function personName(value, names) {
+  const address = String(value || '').trim().toLowerCase()
+  if (!address) return ''
+  const known = names.get(address)
+  if (known) return known
+  const local = address.split('@')[0]
+  return local ? local.charAt(0).toUpperCase() + local.slice(1) : address
+}
+
+/** @param {string} value */
+function shortDay(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value || '')
+  return match ? `${Number(match[2])}/${Number(match[3])}` : value
+}
+
+/**
+ * What a board action says in a card's history, in words.
+ * @param {string} operation
+ * @param {string|null} value
+ * @param {Map<string, string>} names
+ */
+function describeOperation(operation, value, names) {
+  switch (operation) {
+    case 'done': return 'marked it done'
+    case 'reopen': return 'reopened it'
+    case 'assign': return value ? `assigned it to ${personName(value, names)}` : 'cleared the owner'
+    case 'snooze': return value ? `snoozed it to ${shortDay(value)}` : 'snoozed it'
+    case 'delete': return 'deleted it'
+    case 'reorder': return 'moved it'
+    case 'useful': return 'said it was worth a card'
+    case 'not_useful': return 'said it is not a task'
+    case 'nudge': return value ? `asked ${personName(value, names)} for an update` : 'asked for an update'
+    case 'prep': return value ? `asked Aries to prep it for ${personName(value, names)}` : 'asked Aries to prep it'
+    case 'urgent': return value === 'off' ? 'cleared urgent' : 'marked it urgent'
+    default: return operation
+  }
+}
+
+/**
+ * A card's recent history, newest first: board actions from the audit trail, the card's notes
+ * (which include notes written on Aries itself), and the latest email on each side of the
+ * thread from the brief. "Who was last to work on that task" is the newest entry from our side.
+ * @param {any} item
+ * @param {any[]} actions audit rows for this card, any order
+ * @param {Map<string, string>} names from teamNames()
+ */
+function cardHistory(item, actions, names) {
+  /** @type {Array<{at: string, who: string, what: string, ours: boolean, kind: string}>} */
+  const events = []
+  for (const row of actions) {
+    // Notes are already on the card, with their author, including ones still in the queue.
+    if (row.operation === 'note') continue
+    events.push({
+      at: row.at,
+      who: personName(row.actor_email, names),
+      what: describeOperation(row.operation, row.value, names),
+      ours: true,
+      kind: 'action',
+    })
+  }
+  for (const note of Array.isArray(item.notes) ? item.notes : []) {
+    if (!note.at) continue
+    events.push({
+      at: note.at,
+      who: personName(note.by, names) || 'Someone',
+      what: `wrote: ${note.text}`.slice(0, 240),
+      ours: true,
+      kind: 'note',
+    })
+  }
+  const brief = item.brief
+  if (brief && brief.last_ours) {
+    events.push({ at: brief.last_ours.at, who: brief.last_ours.by, what: brief.last_ours.what || 'sent an email', ours: true, kind: 'email' })
+  }
+  if (brief && brief.last_theirs) {
+    events.push({ at: brief.last_theirs.at, who: brief.last_theirs.by, what: brief.last_theirs.what || 'sent an email', ours: false, kind: 'email' })
+  }
+  return events
+    .filter((event) => Number.isFinite(Date.parse(event.at)))
+    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at))
+    .slice(0, HISTORY_PER_CARD)
+}
+
 async function getBoard(request, env) {
   if (request.method !== 'GET') return methodNotAllowed('GET')
   const row = /** @type {SnapshotRow|null} */ (await env.DB.prepare(`
@@ -922,14 +1408,17 @@ async function getBoard(request, env) {
     })
   }
 
+  const team = await loadTeam(env)
   /** @type {BoardSnapshot|null} */
   let snapshot = null
   try {
-    snapshot = curateSnapshot(JSON.parse(row.snapshot_json))
+    snapshot = curateSnapshot(JSON.parse(row.snapshot_json), undefined, briefOwners(team))
   } catch {
     return json({ error: 'Snapshot unavailable' }, 503)
   }
   if (!snapshot) return json({ error: 'Snapshot unavailable' }, 503)
+  const names = teamNames(team)
+  const viewer = memberFor(team, request.headers.get('Cf-Access-Authenticated-User-Email') || '')
   const publishedMillis = Date.parse(row.published_at)
   const ageSeconds = Number.isFinite(publishedMillis)
     ? Math.max(0, Math.floor((Date.now() - publishedMillis) / 1000))
@@ -943,12 +1432,47 @@ async function getBoard(request, env) {
 
   // Keep a checked-off card checked off while Aries catches up, including the short
   // interval between acknowledgement and the next snapshot. A newer snapshot wins.
-  const pending = await completionCommands(env, row.published_at)
-  const items = applyCompletionCommands(snapshot.items, pending)
+  // Everything a teammate has clicked since the last publish is still sitting in the queue.
+  // It has to be folded in here, or the board answers every poll with the pre-click state.
+  const completionPending = await completionCommands(env, row.published_at)
+  const pendingRows = await env.DB.prepare(`
+    SELECT operation, item_id, note, value, actor_email, created_at
+    FROM command_queue
+    WHERE state = 'queued'
+    ORDER BY id
+  `).all()
+  const items = applyPendingCommands(applyCompletionCommands(snapshot.items, completionPending), pendingRows.results || [])
+
+  // Board actions from the audit trail, grouped per card, for each card's history.
+  const since = new Date(Date.now() - HISTORY_DAYS * 86400000).toISOString()
+  const actionRows = await env.DB.prepare(`
+    SELECT item_id, at, actor_email, operation, value
+    FROM activity_log
+    WHERE source = 'board' AND at >= ?
+    ORDER BY at DESC
+    LIMIT 5000
+  `).bind(since).all()
+  /** @type {Map<string, any[]>} */
+  const actionsByCard = new Map()
+  for (const row of actionRows.results || []) {
+    const key = String(row.item_id)
+    if (!actionsByCard.has(key)) actionsByCard.set(key, [])
+    actionsByCard.get(key)?.push(row)
+  }
+  for (const item of items) {
+    if (item.status === 'done') continue
+    const history = cardHistory(item, actionsByCard.get(String(item.id)) || [], names)
+    if (history.length) item.history = history
+  }
 
   return json({
     items,
     thread_ids: threadIds,
+    activity: isActivityOwner(request, env),
+    // Names only: the owner chips and every "Nudge Mark" label read from this.
+    team: team.map((member) => ({ key: member.key, name: member.name })),
+    // Who is signed in, as a roster key, so the My cards tab can show only their cards.
+    me: viewer ? { key: viewer.key, name: viewer.name } : null,
     published_at: row.published_at,
     stale: {
       is_stale: ageSeconds === null || ageSeconds > threshold,
@@ -1170,6 +1694,11 @@ function replayTodos(catalogue, operations) {
       items.set(itemId, item)
     }
     if (!item) continue
+    // The board changed the card after this To-Do check-off or owner change, so the catalogue
+    // already carries the card's newer state. Replaying the older operation would put back what
+    // the board has since changed: an old "Shayan" masking a later hand-off to Katherine.
+    if ((verb === 'toggle' || verb === 'assign') && typeof item.sourceUpdatedAt === 'string'
+        && Date.parse(item.sourceUpdatedAt) > Date.parse(String(operation.server_ts || ''))) continue
     if (verb === 'toggle') {
       const currentRevision = Number(item.sourceRevision)
       const eventRevision = Number(payload.sourceRevision)
@@ -1260,8 +1789,22 @@ async function queueAction(request, env, actorEmail) {
   } else if (action.operation === 'assign') {
     if (typeof action.value !== 'string') return badRequest('Assignee is required')
     value = action.value.trim().toLowerCase()
-    // An empty assignee is how the UI clears an owner.
-    if (value && !BOARD_ASSIGNEES.includes(value)) return badRequest('Unknown assignee')
+    // An empty assignee is how the UI clears an owner. Aries takes a card itself.
+    const assignees = (await loadTeam(env)).map((member) => member.key).concat(['aries'])
+    if (value && !assignees.includes(value)) return badRequest('Unknown assignee')
+  } else if (action.operation === 'urgent') {
+    if (action.value !== 'on' && action.value !== 'off') return badRequest('Urgent is on or off')
+    value = action.value
+  } else if (action.operation === 'prep') {
+    if (typeof action.value !== 'string') return badRequest('Prep needs the teammate it is for')
+    value = action.value.trim().toLowerCase()
+    const teammates = (await loadTeam(env)).map((member) => member.key)
+    if (!value || !teammates.includes(value)) return badRequest('Prep needs a teammate who owns the card')
+  } else if (action.operation === 'nudge') {
+    if (typeof action.value !== 'string') return badRequest('Nudge needs the owner')
+    value = action.value.trim().toLowerCase()
+    const teammates = (await loadTeam(env)).map((member) => member.key)
+    if (!value || !teammates.includes(value)) return badRequest('Nudge needs a teammate who owns the card')
   } else if (action.operation === 'snooze') {
     if (typeof action.value !== 'string') return badRequest('A snooze date is required')
     value = action.value.trim()
@@ -1276,11 +1819,22 @@ async function queueAction(request, env, actorEmail) {
   }
 
   const createdAt = new Date().toISOString()
-  const inserted = await env.DB.prepare(`
-    INSERT INTO command_queue (
-      operation, item_id, note, value, actor_email, state, created_at
-    ) VALUES (?, ?, ?, ?, ?, 'queued', ?)
-  `).bind(action.operation, action.id, note, value, actorEmail, createdAt).run()
+  // The command and its audit row land together or not at all.
+  const [inserted] = await env.DB.batch([
+    env.DB.prepare(`
+      INSERT INTO command_queue (
+        operation, item_id, note, value, actor_email, state, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'queued', ?)
+    `).bind(action.operation, action.id, note, value, actorEmail, createdAt),
+    activityStatement(env, request, {
+      at: createdAt,
+      actorEmail,
+      source: 'board',
+      operation: String(action.operation),
+      itemId: String(action.id),
+      value: note ?? value,
+    }),
+  ])
   const command = {
     id: inserted.meta.last_row_id,
     operation: action.operation,
@@ -1327,6 +1881,59 @@ async function insertTodoOperation(env, operation) {
 }
 
 /**
+ * Frank, 09/30/2026, from the To-Do audit: a task checked off or handed on in the To-Do list
+ * stayed open, or with its old owner, on the board card it came from, so the two lists
+ * disagreed. A To-Do task made from board cards (upstreamIds) now queues the same change for
+ * those cards, which Aries applies like any board click. Tasks added by hand have no cards.
+ * @param {Env} env
+ * @param {JsonObject} operation a stored, newly accepted To-Do operation
+ * @returns {Promise<D1PreparedStatement[]>}
+ */
+async function boardCommandsForTodo(env, operation) {
+  const verb = operation.operation
+  const payload = /** @type {JsonObject} */ (operation.payload || {})
+  /** @type {string|null} */
+  let boardOperation = null
+  /** @type {string|null} */
+  let value = null
+  if (verb === 'toggle') {
+    boardOperation = payload.done === true ? 'done' : 'reopen'
+  } else if (verb === 'assign') {
+    const team = await loadTeam(env)
+    const wanted = String(payload.assignee || '').trim().toLowerCase()
+    // The desktop app sends a name ("Steve"), the board a roster key ("steve").
+    const member = team.find((person) => person.key === wanted || person.name.toLowerCase() === wanted)
+    value = member ? member.key : wanted
+    if (value && value !== 'aries' && !member) return []
+    boardOperation = 'assign'
+  } else {
+    return []
+  }
+  const stored = await readTodoCatalogue(env)
+  const item = stored?.catalogue.items.find((entry) => entry.id === operation.item_id)
+  const upstream = Array.isArray(item?.upstreamIds) ? /** @type {unknown[]} */ (item.upstreamIds) : []
+  const cardIds = [...new Set(upstream.map((id) => {
+    const match = /^(?:board:)?(\d+)$/.exec(String(id))
+    return match ? Number(match[1]) : 0
+  }).filter((id) => Number.isSafeInteger(id) && id > 0))].slice(0, 20)
+  const createdAt = new Date().toISOString()
+  return cardIds.map((id) => env.DB.prepare(`
+    INSERT INTO command_queue (
+      operation, item_id, note, value, actor_email, state, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'queued', ?)
+  `).bind(boardOperation, id, null, value, String(operation.actor_email), createdAt))
+}
+
+/**
+ * @param {Env} env
+ * @param {JsonObject} operation
+ */
+async function queueBoardCommandsForTodo(env, operation) {
+  const statements = await boardCommandsForTodo(env, operation)
+  if (statements.length) await env.DB.batch(statements)
+}
+
+/**
  * @param {Request} request
  * @param {Env} env
  * @param {string} actorEmail
@@ -1335,11 +1942,23 @@ async function insertTodoOperation(env, operation) {
 async function saveTodoAction(request, env, actorEmail) {
   if (request.method !== 'POST') return methodNotAllowed('POST')
   if (!hasJsonContentType(request)) return unsupportedMediaType()
-  const actorName = /** @type {Record<string, string>} */ (ACTOR_NAMES)[actorEmail]
+  const member = memberFor(await loadTeam(env), actorEmail)
+  const actorName = member && TODO_ACTOR_KEYS.includes(member.key) ? member.name : null
   if (!actorName) return forbidden()
   const operation = curateOperation(await readJson(request), { email: actorEmail, name: actorName })
   if (!operation) return badRequest('Invalid todo action')
   const saved = await insertTodoOperation(env, operation)
+  if (saved.accepted) {
+    await activityStatement(env, request, {
+      at: String(saved.operation.server_ts || new Date().toISOString()),
+      actorEmail,
+      source: 'todo',
+      operation: String(operation.operation),
+      itemId: String(operation.item_id),
+      value: JSON.stringify(operation.payload ?? null).slice(0, 300),
+    }).run()
+    await queueBoardCommandsForTodo(env, saved.operation)
+  }
   return json({ ok: true, accepted: saved.accepted, existing: !saved.accepted, operation: saved.operation }, 202)
 }
 
@@ -1368,8 +1987,10 @@ async function publishTodoOperations(request, env) {
   let existing = 0
   for (const operation of operations) {
     const saved = await insertTodoOperation(env, /** @type {JsonObject} */ (operation))
-    if (saved.accepted) accepted += 1
-    else existing += 1
+    if (saved.accepted) {
+      accepted += 1
+      await queueBoardCommandsForTodo(env, saved.operation)
+    } else existing += 1
   }
   return json({ ok: true, accepted, existing, last_sequence: await latestTodoSequence(env) })
 }
@@ -1461,6 +2082,264 @@ async function acknowledgeCommand(request, env, commandId) {
 }
 
 /**
+ * @param {Env} env
+ * @param {URL} url
+ */
+async function readActivity(env, url) {
+  const who = (url.searchParams.get('who') || '').trim().toLowerCase().slice(0, 254)
+  const op = (url.searchParams.get('op') || '').trim().slice(0, 40)
+  const rows = await env.DB.prepare(`
+    SELECT id, at, actor_email, source, operation, item_id, value, title, ip, country, user_agent
+    FROM activity_log
+    WHERE (? = '' OR lower(actor_email) = ?) AND (? = '' OR operation = ?)
+    ORDER BY at DESC, id DESC
+    LIMIT ?
+  `).bind(who, who, op, op, ACTIVITY_LIMIT).all()
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+  const recent = await env.DB.prepare(`
+    SELECT at, actor_email, operation
+    FROM activity_log
+    WHERE at >= ?
+    ORDER BY at
+  `).bind(since).all()
+  const choices = await env.DB.prepare(`
+    SELECT DISTINCT actor_email, operation FROM activity_log
+  `).all()
+
+  /** @type {Map<string, {who: string, op: string, count: number, burst: {count: number, from: string, to: string}|null}>} */
+  const summary = new Map()
+  /** @type {Map<string, number[]>} */
+  const times = new Map()
+  for (const row of recent.results || []) {
+    const key = `${row.actor_email}\u0000${row.operation}`
+    if (!summary.has(key)) summary.set(key, { who: String(row.actor_email), op: String(row.operation), count: 0, burst: null })
+    const entry = /** @type {NonNullable<ReturnType<typeof summary.get>>} */ (summary.get(key))
+    entry.count += 1
+    const list = times.get(key) || []
+    list.push(Date.parse(String(row.at)))
+    times.set(key, list)
+  }
+  // Largest count of one action by one person inside any BURST_WINDOW_MS stretch.
+  for (const [key, list] of times) {
+    let start = 0
+    let best = { count: 0, from: 0, to: 0 }
+    for (let end = 0; end < list.length; end += 1) {
+      while (list[end] - list[start] > BURST_WINDOW_MS) start += 1
+      if (end - start + 1 > best.count) best = { count: end - start + 1, from: list[start], to: list[end] }
+    }
+    const entry = summary.get(key)
+    if (entry && best.count > BURST_COUNT) {
+      entry.burst = { count: best.count, from: new Date(best.from).toISOString(), to: new Date(best.to).toISOString() }
+    }
+  }
+  const people = [...new Set((choices.results || []).map((row) => String(row.actor_email)))].sort()
+  const operations = [...new Set((choices.results || []).map((row) => String(row.operation)))].sort()
+  return {
+    filter: { who, op },
+    summary: [...summary.values()].sort((a, b) => b.count - a.count),
+    people,
+    operations,
+    rows: rows.results || [],
+  }
+}
+
+/** @param {Env} env @param {URL} url */
+async function activityJson(env, url) {
+  return json(await readActivity(env, url))
+}
+
+/** @param {unknown} value */
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] || ch
+  ))
+}
+
+const ACTIVITY_TIME = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  month: 'numeric', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit',
+})
+
+/** @param {unknown} value */
+function activityTime(value) {
+  const millis = Date.parse(String(value))
+  return Number.isFinite(millis) ? ACTIVITY_TIME.format(millis).replace(',', '') : String(value ?? '')
+}
+
+/** @param {unknown} value */
+function shortAgent(value) {
+  const ua = String(value || '')
+  if (!ua) return ''
+  const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'Mac'
+    : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : ''
+  const browser = /Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox'
+    : /Safari\//.test(ua) ? 'Safari' : ua.slice(0, 40)
+  return [browser, os].filter(Boolean).join(' · ')
+}
+
+/** @param {Env} env @param {URL} url */
+async function activityPage(env, url) {
+  const data = await readActivity(env, url)
+  const option = (/** @type {string} */ value, /** @type {string} */ current) =>
+    `<option value="${escapeHtml(value)}"${value === current ? ' selected' : ''}>${escapeHtml(value || 'Everyone')}</option>`
+  const summaryRows = data.summary.map((entry) => `
+      <tr class="${entry.burst ? 'burst' : ''}">
+        <td>${escapeHtml(entry.who)}</td><td>${escapeHtml(entry.op)}</td><td class="num">${entry.count}</td>
+        <td>${entry.burst ? `${entry.burst.count} in 10 min · ${escapeHtml(activityTime(entry.burst.from))} – ${escapeHtml(activityTime(entry.burst.to))}` : ''}</td>
+      </tr>`).join('')
+  const rows = data.rows.map((row) => `
+      <tr class="op-${escapeHtml(row.operation)}">
+        <td class="nowrap">${escapeHtml(activityTime(row.at))}</td>
+        <td>${escapeHtml(row.actor_email)}</td>
+        <td><span class="op">${escapeHtml(row.operation)}</span></td>
+        <td><span class="id">#${escapeHtml(row.item_id)}</span> ${escapeHtml(row.title || '')}</td>
+        <td class="value">${escapeHtml(row.value || '')}</td>
+        <td class="nowrap">${escapeHtml(row.ip || '—')}${row.country ? ` <span class="muted">${escapeHtml(row.country)}</span>` : ''}</td>
+        <td class="muted" title="${escapeHtml(row.user_agent || '')}">${escapeHtml(shortAgent(row.user_agent))}</td>
+      </tr>`).join('')
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aries Activity</title>
+<style>
+  :root { --ink:#17191f; --muted:#69707d; --paper:#f4f5f7; --card:#fff; --line:#dfe2e7; --warn:#fff1e6; --warn-ink:#9a3b00; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#e8eaee; --muted:#9aa1ad; --paper:#14161b; --card:#1d2027; --line:#30343d; --warn:#3a2414; --warn-ink:#ffb27a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--paper); color:var(--ink); font:14px/1.45 system-ui,-apple-system,sans-serif; }
+  h1 { margin:0 0 4px; font-size:22px; } h2 { margin:24px 0 8px; font-size:16px; }
+  p.lead { margin:0 0 16px; color:var(--muted); }
+  a { color:inherit; }
+  form { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 12px; }
+  select, button { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
+  .wrap { overflow-x:auto; background:var(--card); border:1px solid var(--line); border-radius:12px; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); position:sticky; top:0; background:var(--card); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .nowrap { white-space:nowrap; } .muted { color:var(--muted); }
+  .id { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .value { max-width:260px; overflow-wrap:anywhere; color:var(--muted); }
+  .op { font-weight:700; }
+  tr.op-done .op, tr.op-delete .op, tr.op-archive .op { color:var(--warn-ink); }
+  tr.burst td { background:var(--warn); color:var(--warn-ink); font-weight:600; }
+</style></head><body>
+<h1>Activity log</h1>
+<p class="lead">Every change made on the board and To-Do list, newest first. Only you can see this page. <a href="/">Back to board</a></p>
+<h2>Last 24 hours</h2>
+<div class="wrap"><table>
+  <thead><tr><th>Who</th><th>Action</th><th class="num">Count</th><th>Burst (over ${BURST_COUNT} in 10 min)</th></tr></thead>
+  <tbody>${summaryRows || '<tr><td colspan="4" class="muted">No activity in the last 24 hours.</td></tr>'}</tbody>
+</table></div>
+<h2>All actions</h2>
+<form method="get" action="/activity">
+  <select name="who" aria-label="Person">${option('', data.filter.who)}${data.people.map((p) => option(p.toLowerCase(), data.filter.who)).join('')}</select>
+  <select name="op" aria-label="Action"><option value="">All actions</option>${data.operations.map((o) => option(o, data.filter.op)).join('')}</select>
+  <button type="submit">Filter</button>
+  <span class="muted">${data.rows.length}${data.rows.length === ACTIVITY_LIMIT ? '+ (latest ' + ACTIVITY_LIMIT + ')' : ''} actions</span>
+</form>
+<div class="wrap"><table>
+  <thead><tr><th>When (Eastern)</th><th>Who</th><th>Action</th><th>Card</th><th>Detail</th><th>IP</th><th>Device</th></tr></thead>
+  <tbody>${rows || '<tr><td colspan="7" class="muted">Nothing recorded yet.</td></tr>'}</tbody>
+</table></div>
+<p class="muted">IP and device are recorded from 09/29/2026 on; older rows show only who and what.</p>
+</body></html>`
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'cache-control': 'no-store',
+      'content-type': 'text/html; charset=utf-8',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+    },
+  })
+}
+
+/** @param {TeamMember[]} team */
+function teamPayload(team) {
+  return {
+    team: team.map((member) => ({
+      key: member.key,
+      name: member.name,
+      email: member.email,
+      past_emails: member.past_emails,
+    })),
+    domains: TEAM_DOMAINS,
+  }
+}
+
+/**
+ * Add a person, or change a person's name or email. Owner only. `key` present means edit.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {string} actorEmail
+ */
+async function saveTeamMember(request, env, actorEmail) {
+  if (!hasJsonContentType(request)) return unsupportedMediaType()
+  const body = await readJson(request)
+  if (!isObject(body)) return badRequest('Invalid user')
+  const source = /** @type {Record<string, unknown>} */ (body)
+  const name = typeof source.name === 'string' ? source.name.trim().replace(/\s+/g, ' ') : ''
+  const email = typeof source.email === 'string' ? source.email.trim().toLowerCase() : ''
+  if (!name || name.length > TEAM_NAME_LIMIT || !TEAM_NAME.test(name)) {
+    return badRequest('Enter a name: letters, spaces, apostrophes or hyphens, up to 40 characters.')
+  }
+  if (!TEAM_EMAIL.test(email) || email.length > TEAM_EMAIL_LIMIT) return badRequest('Enter a full email address.')
+  if (!TEAM_DOMAINS.includes(email.slice(email.lastIndexOf('@') + 1))) {
+    return badRequest('Use a company address: @flood.doctor, @flooddoctorva.com or @restorationdoctors.com. Aries only emails company addresses, and only those can sign in.')
+  }
+  if (email === 'aries@flood.doctor') return badRequest('That is the address Aries sends from.')
+
+  const team = await loadTeam(env)
+  const at = new Date().toISOString()
+  const isAdd = source.key === undefined || source.key === null || source.key === ''
+  const key = isAdd ? newTeamKey(name, team) : String(source.key)
+  const member = isAdd ? null : team.find((candidate) => candidate.key === key)
+  if (!isAdd && !member) return missing('That user is not on the list.')
+  const holder = team.find((candidate) => candidate.email === email && candidate.key !== key)
+  if (holder) return json({ error: `${holder.name} already uses ${email}.` }, 409)
+
+  /** @param {string} field @param {string|null} before @param {string} after */
+  const change = (field, before, after) => env.DB.prepare(`
+    INSERT INTO team_changes (at, actor_email, user_key, field, old_value, new_value)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(at, actorEmail, key, field, before, after)
+
+  if (!member) {
+    if (team.length >= MAX_TEAM) return badRequest(`The list holds at most ${MAX_TEAM} people.`)
+    if (!key) return badRequest('Could not make an id from that name. Try adding a last name.')
+    await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO team_users (key, name, email, past_emails, position, updated_at, updated_by)
+        VALUES (?, ?, ?, '[]', (SELECT COALESCE(MAX(position), 0) + 1 FROM team_users), ?, ?)
+      `).bind(key, name, email, at, actorEmail),
+      change('added', null, `${name} <${email}>`),
+    ])
+    return json({ ok: true, key, ...teamPayload(await loadTeam(env)) }, 201)
+  }
+
+  if (member.name === name && member.email === email) {
+    return json({ ok: true, key, changed: false, ...teamPayload(team) })
+  }
+  // The address a person leaves stays theirs in history: newest first, and never the new one.
+  const past = member.email === email
+    ? member.past_emails.filter((address) => address !== email)
+    : [member.email, ...member.past_emails.filter((address) => address !== member.email && address !== email)]
+  const statements = [
+    env.DB.prepare(`
+      UPDATE team_users
+      SET name = ?, email = ?, past_emails = ?, updated_at = ?, updated_by = ?
+      WHERE key = ?
+    `).bind(name, email, JSON.stringify(past.slice(0, MAX_PAST_EMAILS)), at, actorEmail, key),
+  ]
+  if (member.name !== name) statements.push(change('name', member.name, name))
+  if (member.email !== email) statements.push(change('email', member.email, email))
+  const [updated] = await env.DB.batch(statements)
+  if (!updated.meta.changes) return json({ error: 'The user list is not set up yet.' }, 409)
+  return json({ ok: true, key, changed: true, ...teamPayload(await loadTeam(env)) })
+}
+
+/**
  * @param {Request} request
  * @param {Env} env
  * @returns {Promise<Response>}
@@ -1477,6 +2356,18 @@ export async function handleRequest(request, env) {
   }
 
   if (host === UI_HOST) {
+    if (ACTIVITY_PATHS.has(url.pathname)) {
+      if (!isActivityOwner(request, env) || !allowedEmail(request, env)) return notFound()
+      if (request.method !== 'GET') return methodNotAllowed('GET')
+      return url.pathname === '/activity' ? activityPage(env, url) : activityJson(env, url)
+    }
+    if (url.pathname === TEAM_PATH) {
+      const ownerEmail = isActivityOwner(request, env) ? allowedEmail(request, env) : null
+      if (!ownerEmail) return notFound()
+      if (request.method === 'GET') return json(teamPayload(await loadTeam(env)))
+      if (request.method === 'POST') return saveTeamMember(request, env, ownerEmail)
+      return methodNotAllowed('GET, POST')
+    }
     if (!UI_PATHS.has(url.pathname)) return notFound()
     const actorEmail = allowedEmail(request, env)
     if (!actorEmail) return forbidden()
@@ -1503,6 +2394,11 @@ export async function handleRequest(request, env) {
   if (url.pathname === '/api/sync/snapshot') return publishSnapshot(request, env)
   if (url.pathname === '/api/sync/worklist') return publishWorklist(request, env)
   if (url.pathname === '/api/sync/threads') return publishThreads(request, env)
+  // Aries keeps its own copy of the roster, so its emails go to the address Frank set here.
+  if (url.pathname === '/api/sync/team') {
+    if (request.method !== 'GET') return methodNotAllowed('GET')
+    return json(teamPayload(await loadTeam(env)))
+  }
   if (url.pathname === '/api/sync/commands') return listCommands(request, env, url)
   if (url.pathname === '/api/sync/todos/catalogue') return publishTodoCatalogue(request, env)
   if (url.pathname === '/api/sync/todos/operations') return publishTodoOperations(request, env)

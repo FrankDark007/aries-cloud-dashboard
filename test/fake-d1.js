@@ -57,7 +57,8 @@ class FakeD1Statement {
       return result(this.database.commands.filter((c) => ['done', 'reopen', 'delete'].includes(c.operation) && (c.state === 'queued' || (c.state === 'applied' && c.acked_at > this.values[0]))).sort((a, b) => a.id - b.id).map((c) => ({ ...c })))
     }
     if (this.query.includes('from command_queue') && this.query.includes("state = 'queued'")) {
-      const limit = Number(this.values[0])
+      // The board read folds in every queued command and binds no limit; the sync read binds one.
+      const limit = this.values.length ? Number(this.values[0]) : Infinity
       const rows = this.database.commands
         .filter((command) => command.state === 'queued')
         .sort((left, right) => left.id - right.id)
@@ -80,6 +81,33 @@ class FakeD1Statement {
         .sort((left, right) => left.sequence - right.sequence)
         .map((operation) => ({ ...operation }))
       return result(rows)
+    }
+    if (this.query.includes('from activity_log')) {
+      // A card's history on the board: that card's actions since a cutoff, newest first.
+      if (this.query.includes("where source = 'board' and at >= ?")) {
+        const since = String(this.values[0])
+        return result(this.database.activity
+          .filter((row) => row.source === 'board' && row.at >= since)
+          .sort((a, b) => b.at.localeCompare(a.at))
+          .map(({ item_id, at, actor_email, operation, value }) => ({ item_id, at, actor_email, operation, value })))
+      }
+      if (this.query.includes('select distinct')) {
+        return result(this.database.activity.map(({ actor_email, operation }) => ({ actor_email, operation })))
+      }
+      if (this.query.includes('where at >= ?')) {
+        const since = String(this.values[0])
+        return result(this.database.activity.filter((row) => row.at >= since).sort((a, b) => a.at.localeCompare(b.at)))
+      }
+      const [who, , op, , limit] = this.values
+      return result(this.database.activity
+        .filter((row) => (!who || row.actor_email.toLowerCase() === who) && (!op || row.operation === op))
+        .sort((a, b) => b.at.localeCompare(a.at) || b.id - a.id)
+        .slice(0, Number(limit)))
+    }
+    if (this.query.includes('from team_users')) {
+      return result([...this.database.team]
+        .sort((left, right) => left.position - right.position || left.key.localeCompare(right.key))
+        .map(({ key, name, email, past_emails }) => ({ key, name, email, past_emails })))
     }
     // Which cards have a rendered email chain. The board serves this so the UI can offer
     // "Open email" only where there is one to open.
@@ -159,6 +187,48 @@ class FakeD1Statement {
       return result([], 1, sequence)
     }
 
+    if (this.query.startsWith('insert into activity_log')) {
+      const [at, actor_email, source, operation, item_id, value, , , , , ip, country, user_agent] = this.values
+      let title = null
+      if (source === 'board' && this.database.snapshot) {
+        const found = JSON.parse(this.database.snapshot.snapshot_json).items.find((item) => String(item.id) === item_id)
+        title = found ? found.title : null
+      } else if (source === 'todo' && this.database.todoCatalogue) {
+        const found = JSON.parse(this.database.todoCatalogue.catalogue_json).items.find((item) => item.id === item_id)
+        title = found ? found.text : null
+      }
+      const id = this.database.activity.length + 1
+      this.database.activity.push({ id, at, actor_email, source, operation, item_id, value, title, ip, country, user_agent })
+      return result([], 1, id)
+    }
+
+    if (this.query.startsWith('insert into team_users')) {
+      const [key, name, email, updated_at, updated_by] = this.values
+      if (this.database.team.some((row) => row.key === key || row.email === email)) {
+        throw new Error('D1_ERROR: UNIQUE constraint failed')
+      }
+      const position = Math.max(0, ...this.database.team.map((row) => row.position)) + 1
+      this.database.team.push({ key, name, email, past_emails: '[]', position, updated_at, updated_by })
+      return result([], 1, this.database.team.length)
+    }
+
+    if (this.query.startsWith('update team_users')) {
+      const [name, email, past_emails, updated_at, updated_by, key] = this.values
+      const row = this.database.team.find((candidate) => candidate.key === key)
+      if (!row) return result([], 0)
+      if (this.database.team.some((other) => other !== row && other.email === email)) {
+        throw new Error('D1_ERROR: UNIQUE constraint failed')
+      }
+      Object.assign(row, { name, email, past_emails, updated_at, updated_by })
+      return result([], 1)
+    }
+
+    if (this.query.startsWith('insert into team_changes')) {
+      const [at, actor_email, user_key, field, old_value, new_value] = this.values
+      this.database.teamChanges.push({ at, actor_email, user_key, field, old_value, new_value })
+      return result([], 1, this.database.teamChanges.length)
+    }
+
     if (this.query.startsWith('update command_queue')) {
       const [state, detail, acked_at, id] = this.values
       const command = this.database.commands.find((candidate) => candidate.id === Number(id))
@@ -183,6 +253,24 @@ export class FakeD1Database {
     this.todoCatalogue = null
     this.todoOperations = []
     this.nextTodoSequence = 1
+    this.activity = []
+    // Empty, as before migration 0007 seeds it; seedTeam() is the seeded roster.
+    this.team = []
+    this.teamChanges = []
+  }
+
+  seedTeam() {
+    const people = [
+      ['frank', 'Frank', 'frankd@flooddoctorva.com'],
+      ['mark', 'Mark', 'mark@flood.doctor'],
+      ['dom', 'Dom', 'dom@flood.doctor'],
+      ['steve', 'Steve', 'steve@restorationdoctors.com'],
+      ['shayan', 'Shayan', 'shyon@restorationdoctors.com'],
+      ['katherine', 'Katherine', 'katherine@restorationdoctors.com'],
+    ]
+    this.team = people.map(([key, name, email], index) => ({
+      key, name, email, past_emails: '[]', position: index + 1, updated_at: '2026-09-30T00:00:00Z', updated_by: 'seed',
+    }))
   }
 
   prepare(query) {

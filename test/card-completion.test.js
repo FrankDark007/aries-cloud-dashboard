@@ -46,6 +46,7 @@ function fixture(t, items = [BASE_ITEM]) {
           async run() { return execute(sql, this.values, 'run') },
         }
       },
+      async batch(statements) { const out = []; for (const statement of statements) out.push(await statement.run()); return out },
     },
   }
   const call = (path, body, options = {}) => {
