@@ -30,7 +30,7 @@
       "database_id": "00000000-0000-0000-0000-000000000000"
     }
   ],
-  "services": [{"binding":"SELF","service":"aries-cloud-dashboard"}],
+  "services": [{"binding":"SELF","service":"aries-cloud-dashboard"},{"binding":"ENGINE","service":"flooddoctor-engine-cloud"}],
   "triggers": { "crons": ["*/5 * * * *"] },
   "observability": {
     "enabled": true,
