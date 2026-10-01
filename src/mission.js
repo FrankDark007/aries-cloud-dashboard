@@ -19,7 +19,20 @@ export async function missionRequest(request, env, canRead) {
     if (!['task','decision','machine','project','spend'].includes(kind) || typeof id !== 'string' || !/^[\w.-]{1,100}$/.test(id) || !data || typeof data !== 'object' || Array.isArray(data)) return new Response('Invalid record',{status:400})
     if(kind==='task' && !['running','done','stopped','failed','waiting'].includes(data.status)) return new Response('Invalid status',{status:400})
     const now = new Date().toISOString()
-    await env.DB.prepare('INSERT INTO mission_records(kind,id,data,updated) VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated').bind(kind,id,JSON.stringify(data),now).run()
+    // Compare within the upsert so concurrent CLI pushes cannot race a read-then-write guard.
+    const result = await env.DB.prepare(`
+      INSERT INTO mission_records(kind,id,data,updated) VALUES(?,?,?,?)
+      ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated
+      WHERE NOT (
+        excluded.kind='task'
+        AND COALESCE(json_extract(excluded.data,'$.origin'),'backfill')='backfill'
+        AND COALESCE(json_extract(mission_records.data,'$.origin'),
+          CASE WHEN lower(COALESCE(json_extract(mission_records.data,'$.status_source'),'')) LIKE '%cli%'
+            OR lower(COALESCE(json_extract(mission_records.data,'$.status_source'),'')) LIKE '%recorder%'
+          THEN 'cli' ELSE 'backfill' END)='cli'
+        AND COALESCE(julianday(json_extract(excluded.data,'$.source_updated')) > julianday(mission_records.updated),0)=0
+      )`).bind(kind,id,JSON.stringify(data),now).run()
+    if (result?.meta?.changes === 0) return Response.json({ok:true,id,skipped:'newer cli push'})
     return Response.json({ok:true,id,updated:now})
   }
   if (!canRead || url.hostname !== 'aries.flood.doctor') return new Response('Forbidden',{status:403})
