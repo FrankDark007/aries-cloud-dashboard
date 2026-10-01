@@ -161,6 +161,29 @@ Returns the full current `catalogue`, `catalogue_published_at`, operations with 
 
 ## Browser contract
 
+### Card-specific completion links
+
+Use `https://aries.flood.doctor/card?id=41` for an email's card button, replacing `41`
+with the verified board ID. The URL contains no token, email address, or completion command.
+The existing Cloudflare Access sign-in applies. GET (including email scanners, previews,
+refresh, and Back/Forward) only reads the title and current state. The user must press
+**Confirm mark done** before the browser sends a same-origin authenticated JSON POST.
+
+- `GET /card?id=41` serves the confirmation view; `GET /api/card?id=41` reads its current card.
+- `POST /api/card/done` accepts exactly `{id,revision}` from that read. Actor/time are server
+  stamped. A changed card requires another review; missing/removed cards cannot be closed.
+- Repeated or simultaneous confirmations are idempotent, including a retry after a lost
+  response. A later explicit reopen permits another completion after a fresh review.
+- The existing durable command queue remains the sync mechanism. Board reads immediately
+  fold in queued Done/Reopen/Delete changes and acknowledged changes newer than the snapshot.
+  The completion page says the action is saved for Aries to sync; it does not claim that
+  the workstation has already applied it.
+- No schema, credentials, Access policy, routing domains, or bindings change is needed.
+
+Verify with `npm test` and `npx wrangler deploy --dry-run --config wrangler.template.jsonc`.
+Deployment must use the existing private deployment configuration, never the placeholder
+template. Record the current Worker version immediately before deploy for rollback.
+
 - `GET /api/board` returns `{items,published_at,stale:{is_stale,age_seconds,after_seconds}}`. A missing first snapshot is a stale empty board; a stopped publisher leaves the last-known snapshot available.
 - `POST /api/action` accepts only `{operation:"done",id}` or `{operation:"note",id,note}`. It records the authenticated actor and returns `202` after the command is durable. Every other operation is rejected.
 

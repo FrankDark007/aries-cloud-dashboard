@@ -1,4 +1,5 @@
 import { APP_HTML } from './ui.js'
+import { CARD_HTML } from './card-ui.js'
 import { missionRequest, checkServices } from './mission.js'
 
 /**
@@ -19,10 +20,11 @@ import { missionRequest, checkServices } from './mission.js'
 /** @typedef {Record<string, unknown>} JsonObject */
 /** @typedef {{items: JsonObject[]}} TodoCatalogue */
 /** @typedef {{catalogue_json: string, published_at: string}} TodoCatalogueRow */
+/** @typedef {{id: number, operation: string, item_id: number, actor_email: string, created_at: string, state: string, acked_at: string|null}} CompletionCommand */
 
 const UI_HOST = 'aries.flood.doctor'
 const SYNC_HOST = 'aries-publish.flood.doctor'
-const UI_PATHS = new Set(['/', '/api/board', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist', '/api/thread'])
+const UI_PATHS = new Set(['/', '/card', '/api/card', '/api/card/done', '/api/board', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist', '/api/thread'])
 const SYNC_PATH = /^\/api\/sync\/(?:snapshot|worklist|threads|commands(?:\/\d+\/ack)?|todos\/(?:catalogue|operations|state))$/
 const MAX_ITEMS = 1000
 const MAX_SNAPSHOT_BYTES = 1_800_000
@@ -117,8 +119,8 @@ function notFound() {
   })
 }
 
-function appHtml() {
-  return new Response(APP_HTML, {
+function appHtml(html = APP_HTML) {
+  return new Response(html, {
     status: 200,
     headers: {
       'cache-control': 'no-store',
@@ -939,8 +941,13 @@ async function getBoard(request, env) {
   const threadRows = await env.DB.prepare('SELECT item_id FROM board_threads').all()
   const threadIds = (threadRows.results || []).map((entry) => entry.item_id)
 
+  // Keep a checked-off card checked off while Aries catches up, including the short
+  // interval between acknowledgement and the next snapshot. A newer snapshot wins.
+  const pending = await completionCommands(env, row.published_at)
+  const items = applyCompletionCommands(snapshot.items, pending)
+
   return json({
-    items: snapshot.items,
+    items,
     thread_ids: threadIds,
     published_at: row.published_at,
     stale: {
@@ -949,6 +956,106 @@ async function getBoard(request, env) {
       after_seconds: threshold,
     },
   })
+}
+
+/** @param {Env} env @param {string} publishedAt */
+async function completionCommands(env, publishedAt) {
+  const result = await env.DB.prepare(`
+    SELECT id, operation, item_id, actor_email, created_at, state, acked_at
+    FROM command_queue
+    WHERE operation IN ('done', 'reopen', 'delete')
+      AND (state = 'queued' OR (state = 'applied' AND acked_at > ?))
+    ORDER BY id
+  `).bind(publishedAt).all()
+  return /** @type {CompletionCommand[]} */ (result.results || [])
+}
+
+/** @param {BoardItem[]} items @param {CompletionCommand[]} commands */
+function applyCompletionCommands(items, commands) {
+  const effective = new Map(items.map((item) => [item.id, { ...item }]))
+  for (const command of commands) {
+    const item = effective.get(Number(command.item_id))
+    if (!item) continue
+    if (command.operation === 'delete') effective.delete(item.id)
+    else if (command.operation === 'done') item.status = 'done'
+    else if (command.operation === 'reopen') item.status = 'open'
+  }
+  return [...effective.values()]
+}
+
+/** @param {Env} env @param {number} id */
+async function completionCard(env, id) {
+  const row = /** @type {SnapshotRow|null} */ (await env.DB.prepare(`
+    SELECT snapshot_json, published_at FROM board_snapshot WHERE singleton_id = 1
+  `).first())
+  if (!row) return null
+  const snapshot = curateSnapshot(JSON.parse(row.snapshot_json))
+  if (!snapshot) throw new Error('Snapshot unavailable')
+  const original = snapshot.items.find((item) => item.id === id)
+  if (!original) return null
+  const commands = await completionCommands(env, row.published_at)
+  const item = applyCompletionCommands([original], commands)[0]
+  const latest = await env.DB.prepare(`
+    SELECT id FROM command_queue
+    WHERE item_id = ? AND operation IN ('done', 'reopen', 'delete') AND state <> 'failed'
+    ORDER BY id DESC LIMIT 1
+  `).bind(id).first()
+  const lastCommandId = Number(latest?.id || 0)
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(original)))
+  const revision = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('') + ':' + lastCommandId
+  return { item: item || original, state: !item ? 'deleted' : item.status === 'done' ? 'done' : 'open', revision, lastCommandId, snapshotJson: row.snapshot_json }
+}
+
+/** @param {Request} request @param {Env} env @param {string} actorEmail */
+async function cardRequest(request, env, actorEmail) {
+  const url = new URL(request.url)
+  const write = url.pathname === '/api/card/done'
+  if (request.method !== (write ? 'POST' : 'GET')) return methodNotAllowed(write ? 'POST' : 'GET')
+  let id
+  let revision
+  if (write) {
+    if (request.headers.get('origin') !== url.origin) return forbidden()
+    if (!hasJsonContentType(request)) return unsupportedMediaType()
+    const body = await readJson(request)
+    if (!isObject(body)) return badRequest('Invalid card confirmation')
+    const action = /** @type {JsonObject} */ (body)
+    if (!hasExactKeys(action, ['id', 'revision']) || typeof action.revision !== 'string' || !action.revision.trim() || action.revision.length > 100) return badRequest('Invalid card confirmation')
+    id = action.id
+    revision = action.revision
+  } else {
+    const value = url.searchParams.get('id') || ''
+    if (!/^[1-9]\d*$/.test(value)) return badRequest('Invalid card id')
+    id = Number(value)
+  }
+  if (!Number.isSafeInteger(id) || /** @type {number} */ (id) <= 0) return badRequest('Invalid card id')
+  let card
+  try { card = await completionCard(env, /** @type {number} */ (id)) }
+  catch { return json({ error: 'Card unavailable. Try again shortly.' }, 503) }
+  if (!card) return missing('This card is no longer on the board. Nothing was changed.')
+  const view = { item: card.item, state: card.state, revision: card.revision }
+  if (!write) return json(view)
+  if (card.state === 'deleted') return json({ error: 'This card was removed. Nothing was changed.', ...view }, 410)
+  if (card.state === 'done') return json({ ok: true, existing: true, ...view })
+  if (revision !== card.revision) return json({ error: 'This card changed. Review it again before marking it done.', ...view }, 409)
+
+  const createdAt = new Date().toISOString()
+  // One atomic compare-and-insert: scanner GETs never reach here, simultaneous
+  // confirmations cannot enqueue duplicates, and a newer card/state is never closed
+  // from an older confirmation. No token or authority is carried in the email URL.
+  const inserted = await env.DB.prepare(`
+    INSERT INTO command_queue (operation, item_id, note, value, actor_email, state, created_at)
+    SELECT 'done', ?, NULL, NULL, ?, 'queued', ?
+    WHERE EXISTS (SELECT 1 FROM board_snapshot WHERE singleton_id = 1 AND snapshot_json = ?)
+      AND COALESCE((SELECT MAX(id) FROM command_queue
+        WHERE item_id = ? AND operation IN ('done', 'reopen', 'delete') AND state <> 'failed'), 0) = ?
+  `).bind(id, actorEmail, createdAt, card.snapshotJson, id, card.lastCommandId).run()
+  if (inserted.meta.changes !== 1) {
+    const current = await completionCard(env, /** @type {number} */ (id))
+    if (current?.state === 'done') return json({ ok: true, existing: true, item: current.item, state: current.state, revision: current.revision })
+    return json({ error: 'This card changed. Refresh and review it before marking it done.' }, 409)
+  }
+  const command = { id: inserted.meta.last_row_id, operation: 'done', item_id: id, actor_email: actorEmail, created_at: createdAt }
+  return json({ ok: true, saved: true, existing: false, item: { ...card.item, status: 'done' }, state: 'done', command }, 202)
 }
 
 /**
@@ -1377,6 +1484,11 @@ export async function handleRequest(request, env) {
       if (request.method !== 'GET') return methodNotAllowed('GET')
       return appHtml()
     }
+    if (url.pathname === '/card') {
+      if (request.method !== 'GET') return methodNotAllowed('GET')
+      return appHtml(CARD_HTML)
+    }
+    if (url.pathname === '/api/card' || url.pathname === '/api/card/done') return cardRequest(request, env, actorEmail)
     if (url.pathname === '/api/board') return getBoard(request, env)
     if (url.pathname === '/api/action') return queueAction(request, env, actorEmail)
     if (url.pathname === '/api/todos') return getTodos(request, env)

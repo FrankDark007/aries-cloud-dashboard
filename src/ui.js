@@ -564,6 +564,12 @@ export const APP_HTML = `<!doctype html>
         fragment.querySelector('.kind').textContent = item.kind || 'operations';
         fragment.querySelector('.priority').textContent = item.priority ? 'P' + item.priority : 'standard';
         fragment.querySelector('.item-id').textContent = '#' + item.id;
+        const cardLink = document.createElement('a');
+        cardLink.className = 'card-action';
+        cardLink.href = '/card?id=' + item.id;
+        cardLink.textContent = 'Card link';
+        cardLink.setAttribute('aria-label', 'Open card #' + item.id);
+        fragment.querySelector('.actions').append(cardLink);
         fragment.querySelector('h3').textContent = item.title;
         fragment.querySelector('.summary').textContent = item.summary || '';
         fragment.querySelector('.assignee').textContent = item.assignee ? 'Assigned to ' + item.assignee : '';

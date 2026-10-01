@@ -53,6 +53,9 @@ class FakeD1Statement {
   }
 
   async all() {
+    if (this.query.includes('from command_queue') && this.query.includes("state = 'applied'")) {
+      return result(this.database.commands.filter((c) => ['done', 'reopen', 'delete'].includes(c.operation) && (c.state === 'queued' || (c.state === 'applied' && c.acked_at > this.values[0]))).sort((a, b) => a.id - b.id).map((c) => ({ ...c })))
+    }
     if (this.query.includes('from command_queue') && this.query.includes("state = 'queued'")) {
       const limit = Number(this.values[0])
       const rows = this.database.commands
