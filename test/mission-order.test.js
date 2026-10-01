@@ -60,3 +60,32 @@ test('backfill missing or invalid source time cannot replace CLI',async()=>{
     assert.equal(result.skipped,'newer cli push')
   }
 })
+
+for (const status of ['done','closed','waiting']) test(`CLI ${status} survives newer backfill evidence and title`,async()=>{
+  const {db,push,row}=fixture()
+  await push({origin:'cli',status:'done',title:'Recorder title'})
+  db.prepare('UPDATE mission_records SET data=?,updated=?').run(JSON.stringify({origin:'cli',status,title:'Recorder title'}),'2020-01-01T00:00:00Z')
+  const before=row()
+  for (const source_updated of [undefined,'2099-01-01T00:00:00Z']) {
+    const result=await push({origin:'backfill',status:'running',title:'Inferred title',source_updated})
+    assert.deepEqual(row(),before)
+    assert.equal(result.skipped,'newer cli push')
+  }
+})
+for (const status of ['running','stopped','failed']) test(`CLI ${status} requires strictly newer evidence`,async()=>{
+  const {db,push,row}=fixture()
+  await push({origin:'cli',status,title:'CLI'})
+  db.exec("UPDATE mission_records SET updated='2021-01-01T00:00:00Z'")
+  const before=row()
+  for (const source_updated of [undefined,'invalid','2020-01-01T00:00:00Z','2021-01-01T00:00:00Z']) {
+    await push({origin:'backfill',status:'done',title:'Stale',source_updated})
+    assert.deepEqual(row(),before)
+  }
+  await push({origin:'backfill',status:'done',title:'Real evidence',source_updated:'2022-01-01T00:00:00Z'})
+  assert.equal(JSON.parse(row().data).title,'Real evidence')
+})
+test('logless backfill creates a missing row',async()=>{
+  const {push,row}=fixture()
+  await push({origin:'backfill',status:'waiting',title:'New'})
+  assert.equal(JSON.parse(row().data).title,'New')
+})

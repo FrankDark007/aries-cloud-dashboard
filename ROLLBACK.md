@@ -35,3 +35,9 @@ Worker rollback: `npx wrangler rollback ccbc5a43-7b77-4672-9c49-d4e2fbd8679d` fr
 Schema undo, only after Worker rollback: `ALTER TABLE mission_answers DROP COLUMN received_by;`
 The additive column may safely remain after rollback. Answer rows and receipt times remain untouched.
 Hook undo: restore the settings backup named in the C34 handoff.
+
+## C42, 10/01/2026
+
+Previous live Worker version: `2aca3eba-74c1-4721-8771-180af8dce379`.
+Rollback: `npx wrangler rollback 2aca3eba-74c1-4721-8771-180af8dce379`.
+No schema, route, Access, cron or secret changes.

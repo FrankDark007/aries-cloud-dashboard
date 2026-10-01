@@ -7,7 +7,8 @@ test('mission feed keeps reads behind Access and writes behind the dedicated bea
   const env={MISSION_TOKEN:'mission-test-only',DB:{prepare(){return {bind(){return this},async run(){writes++},async all(){return {results:[]}}}}}}
   const req=(host,path,init={})=>new Request('https://'+host+path,init)
   assert.equal((await missionRequest(req('aries.flood.doctor','/api/mission'),env,false)).status,403)
-  assert.equal((await missionRequest(req('aries-publish.flood.doctor','/api/mission'),env,true)).status,403)
+  assert.equal((await missionRequest(req('aries-publish.flood.doctor','/api/mission'),env,true)).status,401)
+  assert.equal((await missionRequest(req('aries-publish.flood.doctor','/api/mission',{headers:{authorization:'Bearer mission-test-only'}}),env,false)).status,200)
   assert.equal((await missionRequest(req('aries.flood.doctor','/api/mission'),env,true)).status,200)
   for(const token of ['', 'Bearer publisher-test-only']) {
     assert.equal((await missionRequest(req('aries-publish.flood.doctor','/api/mission/push',{method:'POST',headers:{authorization:token},body:'{}'}),env,false)).status,401)

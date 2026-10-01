@@ -5,13 +5,18 @@ export async function missionRequest(request, env, canRead) {
   const url = new URL(request.url)
   if (url.pathname === '/api/mission/answer' || url.pathname === '/api/mission/answers') return answerRequest(request,env,canRead)
   const post = url.hostname === 'aries-publish.flood.doctor' && url.pathname === '/api/mission/push'
-  if (post) {
-    if (request.method !== 'POST') return new Response('Method not allowed', {status:405})
+  const publisherRead = url.hostname === 'aries-publish.flood.doctor' && url.pathname === '/api/mission'
+  if (post || publisherRead) {
+    if (request.method !== (publisherRead ? 'GET' : 'POST')) return new Response('Method not allowed', {status:405})
     const token = request.headers.get('authorization') || ''
     /** @param {string} s */
     const hash = async s => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))
     const a = await hash(token), b = await hash('Bearer ' + env.MISSION_TOKEN)
     if (!env.MISSION_TOKEN || a.some((v,i)=>v!==b[i])) return new Response('Unauthorized',{status:401})
+    if (publisherRead) {
+      const rows = await env.DB.prepare('SELECT kind,id,data,updated FROM mission_records').all()
+      return Response.json({records:rows.results.map(/** @param {any} r */ r=>({...r,data:JSON.parse(r.data)}))},{headers:{'cache-control':'no-store'}})
+    }
     const raw = await request.text()
     if (raw.length > 100000) return new Response('Too large',{status:413})
     let body
@@ -32,7 +37,8 @@ export async function missionRequest(request, env, canRead) {
           CASE WHEN lower(COALESCE(json_extract(mission_records.data,'$.status_source'),'')) LIKE '%cli%'
             OR lower(COALESCE(json_extract(mission_records.data,'$.status_source'),'')) LIKE '%recorder%'
           THEN 'cli' ELSE 'backfill' END)='cli'
-        AND COALESCE(julianday(json_extract(excluded.data,'$.source_updated')) > julianday(mission_records.updated),0)=0
+        AND (json_extract(mission_records.data,'$.status') IN ('done','closed','waiting')
+          OR COALESCE(julianday(json_extract(excluded.data,'$.source_updated')) > julianday(mission_records.updated),0)=0)
       )`).bind(kind,id,JSON.stringify(data),now).run()
     if (result?.meta?.changes === 0) return Response.json({ok:true,id,skipped:'newer cli push'})
     return Response.json({ok:true,id,updated:now})
