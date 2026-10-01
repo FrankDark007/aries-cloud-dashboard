@@ -10,7 +10,8 @@
     "test": "node --test test/*.test.js",
     "types": "wrangler types --config wrangler.template.jsonc",
     "typecheck": "tsc --noEmit",
-    "check": "npm test && npm run typecheck"
+    "check": "npm test && npm run typecheck",
+    "deploy": "./deploy-guard.sh && wrangler deploy --config wrangler.jsonc"
   },
   "devDependencies": {
     "typescript": "^5.9.2",
