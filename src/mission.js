@@ -15,6 +15,7 @@ export async function missionRequest(request, env, canRead) {
     let body
     try { body = JSON.parse(raw) } catch { return new Response('Invalid JSON',{status:400}) }
     const {kind,id,data} = body
+    if(kind==='check' && id==='cloud'){await checkServices(env);return Response.json({ok:true,id,updated:new Date().toISOString()})}
     if (!['task','decision','machine','project','spend'].includes(kind) || typeof id !== 'string' || !/^[\w.-]{1,100}$/.test(id) || !data || typeof data !== 'object' || Array.isArray(data)) return new Response('Invalid record',{status:400})
     if(kind==='task' && !['running','done','stopped','failed','waiting'].includes(data.status)) return new Response('Invalid status',{status:400})
     const now = new Date().toISOString()
@@ -29,10 +30,22 @@ export async function missionRequest(request, env, canRead) {
 }
 /** @param {any} env */
 export async function checkServices(env) {
-  await Promise.all(['engine.flood.doctor','dashboard.restorationdoctors.com','aries.flood.doctor','crm.flood.doctor'].map(async host=>{
+  const targets = [
+    ['engine.flood.doctor','https://engine.flood.doctor/health'],
+    ['dashboard.restorationdoctors.com','https://dashboard.restorationdoctors.com/'],
+    ['aries.flood.doctor','https://aries-publish.flood.doctor/healthz'],
+    ['crm.flood.doctor','https://crm.flood.doctor/']
+  ]
+  await Promise.all(targets.map(async ([host,url])=>{
     const start=Date.now(); let data
-    try {const r=await fetch('https://'+host+'/healthz',{redirect:'manual',signal:AbortSignal.timeout(10000)}); data={status:r.ok?'up':(r.status>=300&&r.status<400?'waiting':'down'),ms:Date.now()-start,detail:r.status>=300&&r.status<400?'Login gate answered; service health unknown':'HTTP '+r.status}}
-    catch {data={status:'down',ms:Date.now()-start,detail:'No response'}}
+    /** @type {Record<string,string>} */
+    const headers = host==='engine.flood.doctor' ? {'CF-Access-Client-Id':env.ENGINE_ACCESS_ID,'CF-Access-Client-Secret':env.ENGINE_ACCESS_SECRET} : {}
+    try {
+      const r=await fetch(url,{headers,redirect:'manual',signal:AbortSignal.timeout(10000)})
+      const text=(await r.text()).slice(0,1000)
+      const gate=r.status>=300&&r.status<400 || /cloudflare access|sign in.*cloudflare/i.test(text)
+      data={status:gate?'waiting':r.ok?'up':'down',ms:Date.now()-start,detail:gate?'Login gate answered; service health unknown':host==='aries.flood.doctor'?'Worker health check · HTTP '+r.status:'HTTP '+r.status+(url.endsWith('/')?' · homepage response':' · health check')}
+    } catch {data={status:'down',ms:Date.now()-start,detail:'No response'}}
     await env.DB.prepare('INSERT INTO mission_records VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated').bind('service',host,JSON.stringify(data),new Date().toISOString()).run()
   }))
 }
