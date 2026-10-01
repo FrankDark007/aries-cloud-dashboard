@@ -1,7 +1,9 @@
 import { MISSION_HTML } from './mission-ui.js'
-/** @param {Request} request @param {any} env @param {boolean} canRead */
+import { parseOptions } from './mission-state.js'
+/** @param {Request} request @param {any} env @param {boolean|string} canRead */
 export async function missionRequest(request, env, canRead) {
   const url = new URL(request.url)
+  if (url.pathname === '/api/mission/answer' || url.pathname === '/api/mission/answers') return answerRequest(request,env,canRead)
   const post = url.hostname === 'aries-publish.flood.doctor' && url.pathname === '/api/mission/push'
   if (post) {
     if (request.method !== 'POST') return new Response('Method not allowed', {status:405})
@@ -40,6 +42,63 @@ export async function missionRequest(request, env, canRead) {
   if(url.pathname === '/mission') return new Response(MISSION_HTML,{headers:{'content-type':'text/html;charset=utf-8','cache-control':'no-store','content-security-policy':"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"}})
   const rows = await env.DB.prepare('SELECT kind,id,data,updated FROM mission_records').all()
   return Response.json({now:new Date().toISOString(),records:rows.results.map(/** @param {any} r */ r=>({...r,data:JSON.parse(r.data)}))},{headers:{'cache-control':'no-store'}})
+}
+/** @param {Request} request @param {any} env @param {boolean|string} actor */
+async function answerRequest(request, env, actor) {
+  const url = new URL(request.url)
+  /** @param {any} body @param {number} [status] */
+  const response = (body,status=200) => Response.json(body,{status,headers:{'cache-control':'no-store'}})
+  if (url.hostname === 'aries-publish.flood.doctor' && url.pathname === '/api/mission/answers') {
+    if (request.method !== 'POST') return response({error:'Method not allowed'},405)
+    /** @param {string} value */
+    const hash = async value => new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))
+    const a=await hash(request.headers.get('authorization')||''), b=await hash('Bearer '+env.MISSION_TOKEN)
+    if (!env.MISSION_TOKEN || a.some((v,i)=>v!==b[i])) return response({error:'Unauthorized'},401)
+    if (!(request.headers.get('content-type')||'').match(/^application\/json(?:\s*;|$)/i)) return response({error:'JSON required'},415)
+    let body
+    try { body=await request.json() } catch {return response({error:'Invalid JSON'},400)}
+    if (!body || !['new','all'].includes(body.mode)) return response({error:'Invalid mode'},400)
+    // One SQLite statement claims the entire pending set. No read-before-write race.
+    const rows=body.mode==='new'
+      ? await env.DB.prepare('UPDATE mission_answers SET received=? WHERE received IS NULL RETURNING id,card_id,kind,choice,text,created,author').bind(new Date().toISOString()).all()
+      : await env.DB.prepare('SELECT id,card_id,kind,choice,text,created,author FROM mission_answers ORDER BY id').all()
+    return response({answers:rows.results.sort((/** @type {any} */ a,/** @type {any} */ b)=>a.id-b.id)})
+  }
+  if (url.hostname !== 'aries.flood.doctor') return response({error:'Not found'},404)
+  if (typeof actor !== 'string' || !actor) return response({error:'Unauthorized'},401)
+  if (url.pathname === '/api/mission/answers') {
+    if (request.method !== 'GET') return response({error:'Method not allowed'},405)
+    const rows=await env.DB.prepare('SELECT id,card_id,kind,choice,text,created,received FROM mission_answers WHERE author=? ORDER BY id').bind(actor).all()
+    return response({answers:rows.results})
+  }
+  if (request.method !== 'POST') return response({error:'Method not allowed'},405)
+  if (request.headers.get('origin') !== url.origin) return response({error:'Origin does not match'},403)
+  if (!(request.headers.get('content-type')||'').match(/^application\/json(?:\s*;|$)/i)) return response({error:'JSON required'},415)
+  const raw=await request.text()
+  if (raw.length>30000) return response({error:'Too large'},413)
+  let body
+  try {body=JSON.parse(raw)} catch {return response({error:'Invalid JSON'},400)}
+  if (!body || typeof body.card_id!=='string' || !/^[\w.-]{1,100}$/.test(body.card_id) || !['choice','text'].includes(body.kind)) return response({error:'Invalid answer'},400)
+  const card=await env.DB.prepare("SELECT kind,data FROM mission_records WHERE id=? AND kind IN ('decision','task') ORDER BY CASE kind WHEN 'decision' THEN 0 ELSE 1 END LIMIT 1").bind(body.card_id).first()
+  if (!card) return response({error:'Card not found'},404)
+  const data=JSON.parse(card.data)
+  const now=new Date().toISOString()
+  if (body.kind==='choice') {
+    if (typeof body.choice!=='string' || !parseOptions(data.options).some(o=>o.label===body.choice)) return response({error:'Invalid choice'},400)
+    const rows=await env.DB.prepare(`INSERT INTO mission_answers(card_id,kind,choice,created,author)
+      VALUES(?,'choice',?,?,?) ON CONFLICT(card_id,author) WHERE kind='choice'
+      DO UPDATE SET choice=excluded.choice,created=excluded.created WHERE mission_answers.received IS NULL
+      RETURNING id,card_id,kind,choice,text,created,received`).bind(body.card_id,body.choice,now,actor).all()
+    if (!rows.results.length) return response({error:'Received. Use Your instructions to change your choice.'},409)
+    return response({answer:rows.results[0]})
+  }
+  if (typeof body.text!=='string' || !body.text.trim() || body.text.length>4000) return response({error:'Instructions must contain 1 to 4,000 characters'},400)
+  if (body.request_id==null) body.request_id=crypto.randomUUID()
+  if (typeof body.request_id!=='string' || !/^[\w-]{1,100}$/.test(body.request_id)) return response({error:'Invalid request id'},400)
+  const rows=await env.DB.prepare(`INSERT INTO mission_answers(card_id,kind,text,created,author,request_id)
+    VALUES(?,'text',?,?,?,?) ON CONFLICT(author,request_id) DO UPDATE SET request_id=excluded.request_id
+    RETURNING id,card_id,kind,choice,text,created,received`).bind(body.card_id,body.text,now,actor,body.request_id).all()
+  return response({answer:rows.results[0]})
 }
 /** @param {any} env */
 export async function checkServices(env, cause='manual') {

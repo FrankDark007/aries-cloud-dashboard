@@ -1362,7 +1362,7 @@ export async function handleRequest(request, env) {
   const url = new URL(request.url)
   const host = url.hostname
 
-  if (['/mission', '/api/mission', '/api/mission/push'].includes(url.pathname)) return missionRequest(request, env, !!allowedEmail(request, env))
+  if (['/mission', '/api/mission', '/api/mission/push', '/api/mission/answer', '/api/mission/answers'].includes(url.pathname)) return missionRequest(request, env, allowedEmail(request, env) || false)
 
   if (host !== UI_HOST && host !== SYNC_HOST) return notFound()
   if (url.pathname === '/healthz' && request.method === 'GET') {

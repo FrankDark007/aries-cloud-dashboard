@@ -165,3 +165,5 @@ Returns the full current `catalogue`, `catalogue_published_at`, operations with 
 - `POST /api/action` accepts only `{operation:"done",id}` or `{operation:"note",id,note}`. It records the authenticated actor and returns `202` after the command is durable. Every other operation is rejected.
 
 Run `npm test` for real request-routing tests backed by an in-memory D1-compatible fake.
+
+Mission answers (C33): `/api/mission/answer` accepts same-origin JSON choice/text writes using the existing allowed Cloudflare Access email. `/api/mission/answers` reads that email's state. Apply additive migration `0011_mission_answers.sql` before deploying; rollback commands are in `ROLLBACK.md`. Text writes accept an optional `request_id` for safe retries. The publisher host's token-authenticated POST `/api/mission/answers` accepts `{"mode":"new"}` (atomic receive) or `{"mode":"all"}` (read only). `mission answers --new` emits one JSON line per newly received answer; `mission answers --all` emits all answers without changing receipt. “Received” means collected by the poller, not task completion.
