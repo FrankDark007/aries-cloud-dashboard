@@ -511,7 +511,15 @@ export const APP_HTML = `<!doctype html>
     function formatTime(value) {
       if (!value) return 'No snapshot published';
       const date = new Date(value);
-      return Number.isNaN(date.valueOf()) ? value : date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+      if (Number.isNaN(date.valueOf())) return value;
+      const p = {};
+      for (const x of new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }).formatToParts(date)) p[x.type] = x.value;
+      return p.month + '/' + p.day + '/' + p.year + ' ' + p.hour + ':' + p.minute + ' ' + p.dayPeriod + ' ET';
+    }
+
+    function formatDue(value) {
+      const m = /(\\d{4})-(\\d{1,2})-(\\d{1,2})/.exec(String(value || ''));
+      return m ? m[2].padStart(2, '0') + '/' + m[3].padStart(2, '0') + '/' + m[1] : String(value || '');
     }
 
     function setFreshness(payload) {
@@ -559,7 +567,7 @@ export const APP_HTML = `<!doctype html>
         fragment.querySelector('h3').textContent = item.title;
         fragment.querySelector('.summary').textContent = item.summary || '';
         fragment.querySelector('.assignee').textContent = item.assignee ? 'Assigned to ' + item.assignee : '';
-        fragment.querySelector('.due').textContent = item.due ? 'Due ' + item.due : '';
+        fragment.querySelector('.due').textContent = item.due ? 'Due ' + formatDue(item.due) : '';
         fragment.querySelector('.updated').textContent = item.updated ? 'Updated ' + formatTime(item.updated) : '';
         renderNotes(fragment.querySelector('.item-note'), item);
         // Done removes the card immediately. It used to sit there unchanged until the next
@@ -726,7 +734,7 @@ export const APP_HTML = `<!doctype html>
         [
           item.assignee ? 'Assigned · ' + item.assignee : '',
           item.client ? 'Client · ' + item.client : '',
-          item.due ? 'Due · ' + item.due : '',
+          item.due ? 'Due · ' + formatDue(item.due) : '',
           item.snoozedUntil ? 'Snoozed · ' + formatTime(item.snoozedUntil) : '',
           item.archived ? 'Archived' : '',
         ].filter(Boolean).forEach(function (label) {
@@ -887,7 +895,7 @@ export const APP_HTML = `<!doctype html>
         const meta = document.createElement('span');
         meta.className = 'worklist-meta';
         if (item.who) { const who = document.createElement('span'); who.textContent = item.who; meta.append(who); }
-        if (item.due) { const due = document.createElement('span'); due.textContent = 'due ' + item.due; meta.append(due); }
+        if (item.due) { const due = document.createElement('span'); due.textContent = 'due ' + formatDue(item.due); meta.append(due); }
         row.append(mark, text, meta);
         worklist.append(row);
       });

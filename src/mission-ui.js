@@ -51,8 +51,8 @@ details.task>summary{list-style:none;display:grid;grid-template-columns:auto 1fr
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const MOJI=[['â€”','—'],['â€“','–'],['â€™','’'],['â€˜','‘'],['â€œ','“'],['â€\u009d','”'],['â€¦','…'],['â€','—'],['Ã©','é']];
 const fix=s=>{s=String(s==null?'':s);if(/[âÃ]/.test(s))for(const[a,b]of MOJI)s=s.split(a).join(b);return s};
-const FMT=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',month:'numeric',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',hour12:true});
-const when=s=>{if(/^\d{4}-\d{2}-\d{2}$/.test(s))return+s.slice(5,7)+'/'+ +s.slice(8,10)+'/'+s.slice(0,4);const t=Date.parse(s);return s&&!isNaN(t)?FMT.format(new Date(t)).replace(',',' at')+' ET':'No date recorded'};
+const FMT=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',month:'2-digit',day:'2-digit',year:'numeric',hour:'numeric',minute:'2-digit',hour12:true});
+const when=s=>{if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s.slice(5,7)+'/'+s.slice(8,10)+'/'+s.slice(0,4);const t=Date.parse(s);return s&&!isNaN(t)?FMT.format(new Date(t)).replace(',',' at')+' ET':'No date recorded'};
 const mins=s=>{const t=Date.parse(s);return s&&!isNaN(t)?Math.max(0,Math.floor((Date.now()-t)/60000)):null};
 const rel=m=>m==null?'never':m<1?'just now':m<60?m+' min ago':m<1440?Math.floor(m/60)+' hr ago':Math.floor(m/1440)+' days ago';
 const dur=m=>m<60?m+' minutes':m<1440?Math.floor(m/60)+' hours':Math.floor(m/1440)+' days';
@@ -69,7 +69,7 @@ return{id:r.id,title:fix(d.title)||r.id,step:fix(d.step),report:d.report,t,m,k,w
 function taskHtml(x){const stepTxt=x.step&&!/^rc=\d+$/.test(x.step)?x.step:'';
 return'<details class="task'+(x.stuck?' stuck':'')+'" data-id="'+esc(x.id)+'"'+(open.has(x.id)?' open':'')+'><summary><span class="mk" aria-hidden="true">'+MKR[x.k]+'</span><span class="tt">'+esc(x.title)+'<span class="id">'+esc(x.id)+'</span></span><span class="meta"><span class="w '+x.cls+'">'+esc(x.word)+'</span> · updated '+(x.t?rel(x.m):'never')+'</span>'+(stepTxt?'<span class="step">'+esc(stepTxt)+'</span>':'')+'</summary><div class="body"><p><b>Latest step:</b> '+esc(stepTxt||'Nothing recorded')+'</p><p>Last update: '+esc(x.t?when(x.t):'No progress recorded')+'</p><p class="path">Report: '+esc(x.report||'none recorded')+'</p></div></details>'}
 function askCard(a){const opts=a.options?String(a.options).split(/,?\s+or\s+/).map(s=>s.trim()).filter(Boolean):[];
-return'<article class="ask-card"><p class="q">'+esc(fix(a.text))+'</p><p class="since">'+(a.dueIso?(a.dueIso<TODAY()?'<b class="w bad">\u26A0\uFE0F Overdue</b> (due '+esc(a.due)+'). ':'<b>Due today.</b> '):'')+(a.created?'Waiting since '+esc(when(a.created))+' ('+rel(mins(a.created))+')':(a.dueIso?'':'No date recorded'))+'</p>'+(a.todo?'':(opts.length?'<ul class="opts" aria-label="Your choices">'+opts.map(o=>'<li>'+esc(fix(o))+'</li>').join('')+'</ul>':''))+(a.todo?'<a class="btn primary" href="/">Open in to-do list</a>':'')+'</article>'}
+return'<article class="ask-card"><p class="q">'+esc(fix(a.text))+'</p><p class="since">'+(a.dueIso?(a.dueIso<TODAY()?'<b class="w bad">\u26A0\uFE0F Overdue</b> (due '+esc(when(a.dueIso))+'). ':'<b>Due today.</b> '):'')+(a.created?'Waiting since '+esc(when(a.created))+' ('+rel(mins(a.created))+')':(a.dueIso?'':'No date recorded'))+'</p>'+(a.todo?'':(opts.length?'<ul class="opts" aria-label="Your choices">'+opts.map(o=>'<li>'+esc(fix(o))+'</li>').join('')+'</ul>':''))+(a.todo?'<a class="btn primary" href="/">Open in to-do list</a>':'')+'</article>'}
 const TODAY=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York'}).format(new Date());
 const dueIso=s=>{s=String(s||'');let m=/(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);if(m)return m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');m=/(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s);return m?m[3]+'-'+m[1].padStart(2,'0')+'-'+m[2].padStart(2,'0'):''};
 function render(){const by=k=>records.filter(r=>r.kind===k);
@@ -85,7 +85,7 @@ const svcBad=svc.filter(s=>s.st==='down'||s.st==='stale').length,machOff=mst.fil
 document.getElementById('strip').innerHTML=
 '<a class="tile'+(asks.length?' ask':' ok')+'" href="#needs"><b>'+asks.length+'</b><span>need you</span></a>'+
 '<a class="tile" href="#work"><b>'+running+'</b><span>running</span></a>'+
-'<a class="tile'+(problems?' hot':' ok')+'" href="#'+(stuck?'work':machOff?'machines':'cloud')+'"><b>'+(problems?'⚠️ ':'')+problems+'</b><span>'+(problems?'broken or stuck':'nothing broken')+'</span></a>'+
+'<a class="tile'+(problems?' hot':' ok')+'" href="#'+(stuck?'work':machOff?'machines':'cloud')+'">'+(problems?'<b>⚠️ '+problems+'</b><span>broken or stuck</span>':'<b>\u{1F7E2}</b><span>nothing broken</span>')+'</a>'+
 '<a class="tile'+(machOff?' hot':' ok')+'" href="#machines"><b>'+(mst.length-machOff)+' of '+mst.length+'</b><span>machines online'+(machOff?' ('+machOff+' offline)':'')+'</span></a>';
 document.getElementById('needs-n').textContent=asks.length?'oldest first':'';
 const shown=showAllAsks?asks:asks.slice(0,6);
