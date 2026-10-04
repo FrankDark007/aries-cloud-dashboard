@@ -473,6 +473,33 @@ export const APP_HTML = `<!doctype html>
     footer { margin-top: 30px; color: var(--faint); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
 
     @keyframes reveal { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    /* One claim, one card: the client and claim on top, each open task below it as a slim card
+       that keeps its own Done, Snooze, Note and owner. */
+    .claim-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      overflow: hidden;
+      padding: 18px 14px 14px 20px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      animation: reveal .32s both;
+    }
+    .claim-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--blue); }
+    .claim-card[data-urgent="true"]::before { width: 6px; background: var(--red); }
+    .claim-card[data-urgent="true"] { border-color: #f0b7b3; }
+    .claim-head h3 { margin: 0 0 6px; font-size: 19px; line-height: 1.25; letter-spacing: -.02em; }
+    .claim-head .facts { margin: 0 0 4px; }
+    .claim-count { margin: 0 0 12px; color: var(--muted); font-size: 13px; font-weight: 700; }
+    .claim-tasks { display: grid; gap: 8px; }
+    .claim-tasks .card { min-height: 0; padding: 14px 14px 14px 18px; background: #f8f9fb; border-radius: 12px; box-shadow: none; animation: none; }
+    .claim-tasks .card[data-collapsed="false"] { background: var(--surface); }
+    .claim-tasks .card::before { width: 3px; }
+    .claim-tasks .card h3 { margin: 8px 0 4px; font-size: 15.5px; }
+    .claim-tasks .fact-client { display: none; }
     @media (max-width: 980px) { .board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 680px) {
       .shell { padding: 16px 14px 48px; }
@@ -742,6 +769,7 @@ export const APP_HTML = `<!doctype html>
     // sitting above an eleven card board.
     function refreshBoardChrome() {
       const open = boardItems.filter(onBoard).filter(inView);
+      board.querySelectorAll('.claim-card').forEach(fillClaimCard);
       renderSnoozed();
       if (me) showMineButton.textContent = 'My cards (' + boardItems.filter(function (item) {
         return onBoard(item) && String(item.assignee || '').toLowerCase() === me.key;
@@ -784,8 +812,20 @@ export const APP_HTML = `<!doctype html>
         if (leftDue === null || rightDue === null) return (leftDue === null ? 1 : 0) - (rightDue === null ? 1 : 0);
         return leftDue - rightDue;
       });
-      open.forEach(function (item, index) {
-        board.append(buildCard(item, index));
+      // Frank, 10/04/2026: "consolidate the cards and list all open tasks for that claim under
+      // the same card." The worker marks cards that share a client or claim number; they sit in
+      // one claim card, placed where its most pressing task would be, in the same order inside.
+      const slots = [];
+      const claims = new Map();
+      open.forEach(function (item) {
+        const key = item.claim_group || '';
+        if (key && claims.has(key)) { claims.get(key).push(item); return; }
+        const members = [item];
+        if (key) claims.set(key, members);
+        slots.push(members);
+      });
+      slots.forEach(function (members, index) {
+        board.append(members.length > 1 ? buildClaimCard(members, index) : buildCard(members[0], index));
       });
       refreshBoardChrome();
       board.setAttribute('aria-busy', 'false');
@@ -984,6 +1024,49 @@ export const APP_HTML = `<!doctype html>
       item.history = [entry].concat(Array.isArray(item.history) ? item.history : []);
     }
 
+    function buildClaimCard(members, index) {
+      const group = document.createElement('section');
+      group.className = 'claim-card';
+      group.dataset.claim = members[0].claim_group;
+      group.style.animationDelay = Math.min(index * 45, 360) + 'ms';
+      const head = document.createElement('header');
+      head.className = 'claim-head';
+      const name = document.createElement('h3');
+      name.textContent = members[0].claim_label || cardTitle(members[0]);
+      group.setAttribute('aria-label', 'Claim: ' + name.textContent);
+      const facts = document.createElement('p');
+      facts.className = 'facts';
+      const numbers = [];
+      members.forEach(function (item) {
+        const claim = item.brief && item.brief.claim ? String(item.brief.claim) : '';
+        const text = claim ? (/^(invoice|claim)/i.test(claim) ? claim : 'Claim ' + claim) : '';
+        if (text && numbers.indexOf(text) < 0) numbers.push(text);
+      });
+      numbers.forEach(function (text) {
+        const span = document.createElement('span');
+        span.textContent = text;
+        facts.append(span);
+      });
+      const count = document.createElement('p');
+      count.className = 'claim-count';
+      const list = document.createElement('div');
+      list.className = 'claim-tasks';
+      members.forEach(function (item, at) { list.append(buildCard(item, index + at)); });
+      head.append(name, facts, count);
+      group.append(head, list);
+      fillClaimCard(group);
+      return group;
+    }
+
+    // The task count and the urgent bar follow the cards inside. A claim whose last task was
+    // checked off leaves the board with it.
+    function fillClaimCard(group) {
+      const cards = group.querySelectorAll('.card');
+      if (!cards.length) { group.remove(); return; }
+      group.querySelector('.claim-count').textContent = cards.length + (cards.length === 1 ? ' open task' : ' open tasks');
+      group.dataset.urgent = String(Array.prototype.some.call(cards, function (card) { return card.dataset.urgent === 'true'; }));
+    }
+
     function buildCard(item, index) {
       const fragment = template.content.cloneNode(true);
       const card = fragment.querySelector('.card');
@@ -1084,9 +1167,12 @@ export const APP_HTML = `<!doctype html>
       if (brief) {
         // A card with no claim number may carry its invoice number there, already labeled.
         const claim = brief.claim ? (/^invoice/i.test(brief.claim) ? brief.claim : 'Claim ' + brief.claim) : '';
-        [brief.client, claim, brief.amount].filter(Boolean).forEach(function (text) {
+        [brief.client, claim, brief.amount].forEach(function (text, at) {
+          if (!text) return;
           const span = document.createElement('span');
           span.textContent = text;
+          // Inside a claim card the client is already its heading.
+          if (at === 0) span.className = 'fact-client';
           facts.append(span);
         });
       }

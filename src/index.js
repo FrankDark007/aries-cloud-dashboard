@@ -1,6 +1,7 @@
 import { APP_HTML } from './ui.js'
 import { CARD_HTML } from './card-ui.js'
 import { missionRequest, checkServices } from './mission.js'
+import { claimGroups } from './claim-groups.js'
 
 /**
  * @typedef {object} BoardItem
@@ -1462,6 +1463,15 @@ async function getBoard(request, env) {
     if (item.status === 'done') continue
     const history = cardHistory(item, actionsByCard.get(String(item.id)) || [], names)
     if (history.length) item.history = history
+  }
+
+  // Cards for the same client or claim number, so the board can show them as one claim card.
+  const groups = claimGroups(items, { staff: team.flatMap((member) => [member.key, member.name]) })
+  for (const item of items) {
+    const group = groups.get(item.id)
+    if (!group) continue
+    item.claim_group = group.key
+    item.claim_label = group.label
   }
 
   return json({
