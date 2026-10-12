@@ -1,5 +1,5 @@
 import { MISSION_HTML } from './mission-ui.js'
-import { parseOptions } from './mission-state.js'
+import { evidenceFreshness, parseOptions } from './mission-state.js'
 /** @param {Request} request @param {any} env @param {boolean|string} canRead */
 export async function missionRequest(request, env, canRead) {
   const url = new URL(request.url)
@@ -108,6 +108,32 @@ async function answerRequest(request, env, actor) {
     RETURNING id,card_id,kind,choice,text,created,received,received_by`).bind(body.card_id,body.text,now,actor,body.request_id).all()
   return response({answer:rows.results[0]})
 }
+/** A responding homepage proves availability only. Operational health requires dated evidence.
+ * @param {number} status @param {string} text @param {number} [now] */
+export function serviceProbe(status, text, now=Date.now()) {
+  const gate=status>=300&&status<400 || [401,403].includes(status) || /cloudflare access|sign in.*cloudflare/i.test(text)
+  const ok=status>=200&&status<300
+  const availability=gate?'gated':ok?'available':'unavailable'
+  let body
+  try {body=JSON.parse(text)} catch {}
+  const source=body?.operational
+  const sources=Array.isArray(source?.sources)?source.sources.slice(0,30).map((/** @type {any} */ s)=>({name:String(s?.name||'Source').slice(0,100),status:String(s?.status||'unknown'),last_evidence_at:s?.last_evidence_at||null,after_seconds:s?.after_seconds===undefined?600:s.after_seconds})):[]
+  const queue=source?.queue, hasQueue=queue && Number.isSafeInteger(queue.pending)&&queue.pending>=0&&Number.isSafeInteger(queue.failed)&&queue.failed>=0
+  const checked=evidenceFreshness(source?.checked_at,10,now)
+  /** @param {any} at @param {any} afterSeconds */
+  const currentEvidence=(at,afterSeconds)=>{
+    if (typeof afterSeconds!=='number'||!Number.isFinite(afterSeconds)||afterSeconds<=0) return false
+    const evidence=evidenceFreshness(at,afterSeconds/60,now),age=now-Date.parse(at)
+    return evidence.status==='current'&&age>=0&&age<=afterSeconds*1000
+  }
+  let health='unknown'
+  if (ok&&!gate&&currentEvidence(source?.checked_at,600)&&(sources.length||hasQueue)) {
+    if (source.status==='degraded') health='degraded'
+    if (source.status==='healthy'&&sources.length&&sources.every((/** @type {any} */ s)=>['current','healthy'].includes(s.status)&&currentEvidence(s.last_evidence_at,s.after_seconds))&&(!hasQueue||queue.failed===0)) health='healthy'
+  }
+  const detail=gate?'Access gate answered; operational health unknown':!ok?'HTTP '+status+'; service unavailable':health==='healthy'?'Fresh operational checks passed':health==='degraded'?'Operational checks report a problem':'HTTP '+status+'; reachable, operational evidence unavailable'
+  return {status:gate?'waiting':ok?'up':'down',availability,operational:{status:health,checked_at:checked.at,sources,...(hasQueue?{queue:{pending:queue.pending,failed:queue.failed}}:{})},detail}
+}
 /** @param {any} env */
 export async function checkServices(env, cause='manual') {
   const targets = [
@@ -118,16 +144,15 @@ export async function checkServices(env, cause='manual') {
   ]
   await Promise.all(targets.map(async ([host,url])=>{
     const start=Date.now();
-    /** @type {{status:string,ms:number,detail:string,checked_by?:string}} */
+    /** @type {any} */
     let data
     /** @type {Record<string,string>} */
-    const headers = host==='engine.flood.doctor' ? {'CF-Access-Client-Id':env.ENGINE_ACCESS_ID,'CF-Access-Client-Secret':env.ENGINE_ACCESS_SECRET} : {}
+    const headers = host==='engine.flood.doctor' ? {'CF-Access-Client-Id':env.ENGINE_ACCESS_ID,'CF-Access-Client-Secret':env.ENGINE_ACCESS_SECRET} : host==='aries.flood.doctor'&&env.MISSION_TOKEN ? {Authorization:'Bearer '+env.MISSION_TOKEN} : {}
     try {
-      const r=host==='aries.flood.doctor' && env.SELF ? await env.SELF.fetch('https://aries.flood.doctor/healthz') : host==='engine.flood.doctor' && env.ENGINE ? await env.ENGINE.fetch(url,{headers}) : await fetch(url,{headers,redirect:'manual',signal:AbortSignal.timeout(10000)})
-      const text=(await r.text()).slice(0,1000)
-      const gate=r.status>=300&&r.status<400 || /cloudflare access|sign in.*cloudflare/i.test(text)
-      data={status:gate?'waiting':r.ok?'up':'down',ms:Date.now()-start,detail:gate?'Login gate answered; service health unknown':host==='aries.flood.doctor'?'Worker health check · HTTP '+r.status:'HTTP '+r.status+(url.endsWith('/')?' · homepage response':' · health check')}
-    } catch {data={status:'down',ms:Date.now()-start,detail:'No response'}}
+      const r=host==='aries.flood.doctor' && env.SELF ? await env.SELF.fetch('https://aries.flood.doctor/healthz',{headers}) : host==='engine.flood.doctor' && env.ENGINE ? await env.ENGINE.fetch(url,{headers}) : await fetch(url,{headers,redirect:'manual',signal:AbortSignal.timeout(10000)})
+      const text=(await r.text()).slice(0,32000)
+      data={...serviceProbe(r.status,text),ms:Date.now()-start}
+    } catch {data={status:'down',availability:'unavailable',operational:{status:'unknown'},ms:Date.now()-start,detail:'No response; operational health unknown'}}
     data.checked_by=cause
     await env.DB.prepare('INSERT INTO mission_records VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated').bind('service',host,JSON.stringify(data),new Date().toISOString()).run()
   }))

@@ -3,7 +3,7 @@ import test from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
 import worker from '../src/index.js'
-import { parseOptions, taskFailure } from '../src/mission-state.js'
+import { parseOptions, taskFailure, taskState, taskCounts } from '../src/mission-state.js'
 import { MISSION_HTML } from '../src/mission-ui.js'
 
 // Execute the actual SQL, including partial indexes and RETURNING, rather than simulate claims.
@@ -82,8 +82,10 @@ test('safe retries keep a text submission once after a lost response',async()=>{
 test('tile counts actual failures while stale runs and successful stops stay visible',()=>{
   const rows=[{data:{status:'running',step:'quiet for two days'}},{data:{status:'stopped',step:'rc=0'}},{data:{status:'failed',step:'down'}},{data:{status:'stopped',step:'rc=1'}},{data:{status:'stopped',failure_cause:'connection lost'}},{data:{status:'done',step:'old failure recovered'}},{data:{status:'waiting'}}]
   assert.equal(rows.filter(taskFailure).length,3)
-  assert.match(MISSION_HTML,/stuck=tasks\.filter\(x=>x\.failure\)/)
-  assert.match(MISSION_HTML,/svcBad=svc\.filter\(s=>s\.st==='down'\|\|s\.st==='stale'\)/)
+  const counts=taskCounts(rows.map(r=>taskState(r)))
+  assert.equal(counts.failed,3)
+  assert.equal(counts.running,1)
+  assert.equal(counts.stopped,1)
 })
 test('Mission script parses and includes accessible card controls and retained drafts',()=>{
   const script=MISSION_HTML.match(/<script>([\s\S]*?)<\/script>/)[1]
