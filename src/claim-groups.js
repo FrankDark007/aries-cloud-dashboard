@@ -7,7 +7,9 @@
 
 /** @typedef {{tokens: string[], first: string, last: string}} Person */
 /** @typedef {{people: Person[], org: string, rollup: boolean}} Client */
-/** @typedef {{key: string, label: string}} ClaimGroup */
+import { canonicalIdentity, curateCardMetadata } from './card-data.js'
+
+/** @typedef {{key: string, label: string, reason:string, reasons:string[], conflicts:Array<{card_id:number,field:string,message:string}>}} ClaimGroup */
 
 // Never a client: us, the carriers, Aries' own placeholders. A card "for USAA" is about many
 // claims at once, and grouping on it would pile unrelated claims into one card.
@@ -144,8 +146,30 @@ function endsWith(whole, tail) {
  * @returns {Map<number, ClaimGroup>}
  */
 export function claimGroups(items, options = {}) {
+  return claimGroupDetails(items, options).groups
+}
+
+/**
+ * Exposes attempted grouping conflicts even for cards left on their own. A name match
+ * cannot bridge two different explicit identities through a third, unidentified card.
+ * @param {Array<Record<string, any>>} items
+ * @param {{staff?: Iterable<string>}} [options]
+ */
+export function claimGroupDetails(items, options = {}) {
   const staff = new Set([...(options.staff || [])].map((name) => plain(String(name)).trim()).filter(Boolean))
-  const open = items.filter((item) => item && item.status !== 'done' && Number.isSafeInteger(item.id))
+  const open = items.filter((item) => item && item.status !== 'done' && Number.isSafeInteger(item.id)).sort((a, b) => a.id - b.id)
+  const metadata = new Map(open.map(item => [item.id, curateCardMetadata(item)]))
+  const components = new Map(open.map(item => [item.id, {
+    ids: new Map(['claim_id', 'client_id', 'invoice_id'].map(field => {
+      const id = canonicalIdentity(metadata.get(item.id)?.identity[field])
+      return [field, new Set(id ? [id] : [])]
+    })),
+    contradictory: Boolean(metadata.get(item.id)?.quality.issues.some(issue => issue.code.startsWith('conflicting_'))),
+  }]))
+  /** @type {Map<number, Array<{card_id:number,field:string,message:string}>>} */
+  const conflicts = new Map()
+  /** @type {Map<number, Set<string>>} */
+  const reasons = new Map(open.map(item => [item.id, new Set()]))
   /** @type {Map<number, number>} */
   const parent = new Map(open.map((item) => [item.id, item.id]))
   /** @param {number} id @returns {number} */
@@ -155,11 +179,35 @@ export function claimGroups(items, options = {}) {
     parent.set(id, root)
     return root
   }
-  /** @param {number} left @param {number} right */
-  const join = (left, right) => {
+  /** @param {number} root @param {string} field */
+  const values = (root, field) => components.get(root)?.ids.get(field) || new Set()
+  /** @param {number} left @param {number} right @param {string} reason */
+  const join = (left, right, reason) => {
     const a = find(left)
     const b = find(right)
-    if (a !== b) parent.set(Math.max(a, b), Math.min(a, b))
+    if (a === b) return
+    for (const field of ['claim_id', 'client_id', 'invoice_id']) {
+      // Multiple invoices can legitimately belong to one explicit claim.
+      if (field === 'invoice_id' && [...values(a, 'claim_id')].some(id => values(b, 'claim_id').has(id))) continue
+      const av = values(a, field)
+      const bv = values(b, field)
+      if (av.size && bv.size && new Set([...av, ...bv]).size > 1) {
+        for (const [id, other] of [[left, right], [right, left]]) {
+          const entries = conflicts.get(id) || []
+          if (!entries.some(entry => entry.card_id === other && entry.field === field)) entries.push({ card_id: other, field, message: `Not grouped: conflicting ${field.replace('_', ' ')} values.` })
+          conflicts.set(id, entries)
+        }
+        return
+      }
+    }
+    // A contradictory card must not spread its uncertain identity into another group.
+    if (components.get(a)?.contradictory || components.get(b)?.contradictory) return
+    const kept = Math.min(a, b)
+    const removed = Math.max(a, b)
+    for (const field of ['claim_id', 'client_id', 'invoice_id']) for (const id of values(removed, field)) values(kept, field).add(id)
+    parent.set(removed, kept)
+    reasons.get(left)?.add(reason)
+    reasons.get(right)?.add(reason)
   }
 
   /** @type {Map<number, Client|null>} */
@@ -172,9 +220,15 @@ export function claimGroups(items, options = {}) {
   const named = new Map()
   /** @type {Array<{id: number, who: Person}>} */
   const surnameOnly = []
+  /** @type {Map<string, number[]>} */
+  const byIdentity = new Map()
 
   for (const item of open) {
     const brief = item.brief && typeof item.brief === 'object' ? item.brief : {}
+    for (const field of ['claim_id', 'invoice_id', 'client_id']) {
+      const id = canonicalIdentity(metadata.get(item.id)?.identity[field])
+      if (id) byIdentity.set(`${field}:${id}`, [...(byIdentity.get(`${field}:${id}`) || []), item.id])
+    }
     for (const number of claimNumbers(brief.claim)) {
       byNumber.set(number, [...(byNumber.get(number) || []), item.id])
     }
@@ -188,13 +242,19 @@ export function claimGroups(items, options = {}) {
     }
   }
 
-  for (const ids of [...byNumber.values(), ...byOrg.values()]) {
-    for (const id of ids.slice(1)) join(ids[0], id)
+  for (const [identity, ids] of byIdentity) {
+    for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, `Matching explicit ${identity.split(':')[0].replace('_', ' ')}`)
+  }
+  for (const ids of byNumber.values()) {
+    for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching claim or invoice number in the brief')
+  }
+  for (const ids of byOrg.values()) {
+    for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching organisation name, identity not confirmed')
   }
   for (const entries of named.values()) {
     for (let i = 0; i < entries.length; i += 1) {
       for (let j = i + 1; j < entries.length; j += 1) {
-        if (sameFirst(entries[i].who.first, entries[j].who.first)) join(entries[i].id, entries[j].id)
+        if (sameFirst(entries[i].who.first, entries[j].who.first)) join(entries[i].id, entries[j].id, 'Matching client name, identity not confirmed')
       }
     }
   }
@@ -206,12 +266,12 @@ export function claimGroups(items, options = {}) {
     const matches = (named.get(who.last) || []).filter((entry) => endsWith(entry.who, who))
     const onePerson = matches.every((left) => matches.every((right) => sameFirst(left.who.first, right.who.first)))
     if (!onePerson) continue
-    for (const match of matches) join(id, match.id)
+    for (const match of matches) join(id, match.id, 'Unambiguous client surname, identity not confirmed')
     const key = who.tokens.join(' ')
     loneSurnames.set(key, [...(loneSurnames.get(key) || []), id])
   }
   for (const ids of loneSurnames.values()) {
-    for (const id of ids.slice(1)) join(ids[0], id)
+    for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching client surname, identity not confirmed')
   }
 
   /** @type {Map<number, Array<Record<string, any>>>} */
@@ -224,10 +284,25 @@ export function claimGroups(items, options = {}) {
   const groups = new Map()
   for (const [root, group] of members) {
     if (group.length < 2) continue
-    const entry = { key: `claim-${root}`, label: groupLabel(group, clients) }
+    let key = ''
+    for (const field of ['claim_id', 'invoice_id', 'client_id']) {
+      const ids = values(root, field)
+      if (ids.size === 1) { key = `${field}:${[...ids][0]}`; break }
+    }
+    if (!key) {
+      const numbers = [...new Set(group.flatMap(item => claimNumbers(item.brief?.claim)))].sort()
+      const names = group.flatMap(item => {
+        const client = clients.get(item.id)
+        return client?.org ? [client.org] : (client?.people || []).map(who => `${who.last}:${canonicalFirst(who.first)}`)
+      }).sort()
+      key = numbers.length ? `claim-number:${numbers[0]}` : names.length ? `client-name:${names[0]}` : `claim-${root}`
+    }
+    const groupReasons = [...new Set(group.flatMap(item => [...(reasons.get(item.id) || [])]))]
+    const entry = { key, label: groupLabel(group, clients), reason: groupReasons[0] || 'Shared identity', reasons: groupReasons,
+      conflicts: group.flatMap(item => conflicts.get(item.id) || []) }
     for (const item of group) groups.set(item.id, entry)
   }
-  return groups
+  return { groups, conflicts }
 }
 
 /**
