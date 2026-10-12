@@ -1,3 +1,5 @@
+import { BOARD_UPGRADE_CSS, BOARD_UPGRADE_CONTROLS, BOARD_UPGRADE_DIALOGS, BOARD_UPGRADE_SCRIPT } from './board-ui-upgrades.js'
+
 export const APP_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -523,6 +525,7 @@ export const APP_HTML = `<!doctype html>
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition-duration: .01ms !important; }
     }
+${BOARD_UPGRADE_CSS}
   </style>
 </head>
 <body>
@@ -544,6 +547,7 @@ export const APP_HTML = `<!doctype html>
     <nav class="view-switch" aria-label="Aries view"><a href="/mission" style="padding:12px;color:inherit">Mission Control</a>
       <button id="show-board" type="button" aria-pressed="true">Board</button>
       <button id="show-mine" type="button" aria-pressed="false" hidden>My cards</button>
+      <button id="show-exceptions" type="button" aria-pressed="false">Exceptions</button>
       <button id="show-todos" type="button" aria-pressed="false">To-Do</button>
       <button id="show-worklist" type="button" aria-pressed="false">Full list</button>
       <button id="show-checked" type="button" aria-pressed="false">Checked off</button>
@@ -562,6 +566,7 @@ export const APP_HTML = `<!doctype html>
           <div><h2 id="board-title">Team attention</h2><p id="board-subtitle">Curated operational items from Aries.</p></div>
           <div class="todo-toolbar"><button id="expand-all" class="refresh-button" type="button">Expand all</button><button id="refresh" class="refresh-button" type="button">Refresh</button></div>
         </div>
+${BOARD_UPGRADE_CONTROLS}
         <div id="board" class="board" aria-busy="true"></div>
         <details id="snoozed-list" class="snoozed-list" hidden><summary></summary><div class="snoozed-rows"></div></details>
       </section>
@@ -669,6 +674,7 @@ export const APP_HTML = `<!doctype html>
       <div class="dialog-actions"><button class="dialog-action" type="button" id="aries-cancel">Cancel</button><button class="dialog-action primary" type="submit" id="aries-submit">Give it to Aries</button></div>
     </form>
   </dialog>
+${BOARD_UPGRADE_DIALOGS}
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script>
@@ -737,8 +743,8 @@ export const APP_HTML = `<!doctype html>
     function setFreshness(payload) {
       const stale = payload.stale || { is_stale: true };
       stateBadge.className = 'state-badge' + (stale.is_stale ? ' stale' : '');
-      stateBadge.textContent = stale.is_stale ? 'Last known' : 'Current';
-      published.textContent = payload.published_at ? 'Published ' + formatTime(payload.published_at) : 'Waiting for first snapshot';
+      stateBadge.textContent = stale.is_stale ? 'Snapshot old' : 'Snapshot current';
+      published.textContent = payload.published_at ? 'Snapshot published ' + formatTime(payload.published_at) : 'Waiting for first snapshot';
     }
 
     function isUrgent(item) {
@@ -755,11 +761,11 @@ export const APP_HTML = `<!doctype html>
 
     function isResting(item) {
       const day = String(item.due || '').slice(0, 10);
-      return item.status === 'snoozed' && ISO_DAY_PATTERN.test(day) && day > todayIso();
+      return !item.pending && item.status === 'snoozed' && ISO_DAY_PATTERN.test(day) && day > todayIso();
     }
 
     function onBoard(item) {
-      return item.status !== 'done' && !isResting(item);
+      return (item.status !== 'done' || (item.pending && (item.command_receipt||{}).operation === 'done')) && !isResting(item);
     }
 
     let threadIds = new Set();
@@ -768,7 +774,8 @@ export const APP_HTML = `<!doctype html>
     // that takes a card away has to recompute them. Removing only the node left "12 open"
     // sitting above an eleven card board.
     function refreshBoardChrome() {
-      const open = boardItems.filter(onBoard).filter(inView);
+      const open = visibleBoardItems();
+      updateUpgradeChrome();
       board.querySelectorAll('.claim-card').forEach(fillClaimCard);
       renderSnoozed();
       if (me) showMineButton.textContent = 'My cards (' + boardItems.filter(function (item) {
@@ -779,7 +786,11 @@ export const APP_HTML = `<!doctype html>
       document.querySelector('#urgent-count').textContent = String(open.filter(isUrgent).length);
       document.querySelector('#assigned-count').textContent = String(open.filter(function (item) { return Boolean(item.assignee); }).length);
 
-      const hasCard = Boolean(board.querySelector('.card'));
+      const hasCard = Boolean(board.querySelector('.card, .compact-table tbody tr'));
+      if (!hasCard && (filters.query || filters.owner || filters.client || filters.claim || filters.status || activeView === 'exceptions')) {
+        const prior = board.querySelector('.empty'); if (prior) prior.remove();
+        const empty = document.createElement('div'); empty.className = 'empty'; empty.textContent = 'No cards match this view. Change or clear the filters.'; board.append(empty); return;
+      }
       const placeholder = board.querySelector('.empty');
       if (hasCard) {
         if (placeholder) placeholder.remove();
@@ -797,38 +808,26 @@ export const APP_HTML = `<!doctype html>
     }
 
     function render(items) {
-      board.replaceChildren();
-      // Only open cards belong on the board. Checked-off rows now travel in the same snapshot
-      // so they can be undone, and they live in the Checked off tab, not here. Snoozed cards
-      // wait in the list under the board until their date. Urgent cards go first, then cards
-      // overdue or due within a week, soonest first; the sort is stable, so everything else
-      // keeps Aries' order.
+      const restoreFocus = rememberFocus();
       board.dataset.layout = boardFilter === 'mine' ? 'list' : 'grid';
-      const open = items.filter(onBoard).filter(inView).sort(function (left, right) {
+      const open = items.filter(boardScope).filter(inView).filter(filteredBoardItem).sort(function (left, right) {
         const urgent = Number(isUrgent(right)) - Number(isUrgent(left));
         if (urgent) return urgent;
-        const leftDue = sortDeadline(left);
-        const rightDue = sortDeadline(right);
+        const leftDue = sortDeadline(left), rightDue = sortDeadline(right);
         if (leftDue === null || rightDue === null) return (leftDue === null ? 1 : 0) - (rightDue === null ? 1 : 0);
         return leftDue - rightDue;
       });
-      // Frank, 10/04/2026: "consolidate the cards and list all open tasks for that claim under
-      // the same card." The worker marks cards that share a client or claim number; they sit in
-      // one claim card, placed where its most pressing task would be, in the same order inside.
-      const slots = [];
-      const claims = new Map();
+      const slots = [], claims = new Map();
       open.forEach(function (item) {
         const key = item.claim_group || '';
         if (key && claims.has(key)) { claims.get(key).push(item); return; }
-        const members = [item];
-        if (key) claims.set(key, members);
-        slots.push(members);
+        const members = [item]; if (key) claims.set(key,members); slots.push(members);
       });
-      slots.forEach(function (members, index) {
-        board.append(members.length > 1 ? buildClaimCard(members, index) : buildCard(members[0], index));
-      });
+      const nodes = board.dataset.density === 'compact' && open.length ? [renderCompactTable(open)] : slots.map(function (members,index) { return members.length > 1 ? buildClaimCard(members,index) : buildCard(members[0],index); });
+      reconcileChildren(board,nodes);
       refreshBoardChrome();
-      board.setAttribute('aria-busy', 'false');
+      board.setAttribute('aria-busy','false');
+      restoreFocus();
     }
 
     // ---- Cards ------------------------------------------------------------------------------
@@ -1025,6 +1024,12 @@ export const APP_HTML = `<!doctype html>
     }
 
     function buildClaimCard(members, index) {
+      const cached = groupNodes.get(members[0].claim_group);
+      if (cached) {
+        cached.querySelector('.claim-head h3').textContent = members[0].claim_label || cardTitle(members[0]);
+        reconcileChildren(cached.querySelector('.claim-tasks'), members.map(function(item, at) { return buildCard(item,index+at); }));
+        fillClaimCard(cached); return cached;
+      }
       const group = document.createElement('section');
       group.className = 'claim-card';
       group.dataset.claim = members[0].claim_group;
@@ -1055,6 +1060,7 @@ export const APP_HTML = `<!doctype html>
       head.append(name, facts, count);
       group.append(head, list);
       fillClaimCard(group);
+      groupNodes.set(members[0].claim_group,group);
       return group;
     }
 
@@ -1068,9 +1074,16 @@ export const APP_HTML = `<!doctype html>
     }
 
     function buildCard(item, index) {
+      const cached = cardNodes.get(String(item.id));
+      if (cached) {
+        if (!cached.contains(document.activeElement) && !cached.querySelector('.choices:not([hidden])')) fillCard(cached,item);
+        else decorateCard(cached,item);
+        return cached;
+      }
       const fragment = template.content.cloneNode(true);
       const card = fragment.querySelector('.card');
       card.dataset.id = String(item.id);
+      cardNodes.set(String(item.id),card);
       card.dataset.priority = String(item.priority || 'normal').toLowerCase();
       card.querySelector('[data-action="urgent"]').addEventListener('click', function (event) {
         toggleUrgent(card, item, event.currentTarget);
@@ -1080,10 +1093,11 @@ export const APP_HTML = `<!doctype html>
         setCollapsed(card, item, card.dataset.collapsed !== 'true');
       });
       card.addEventListener('click', function (event) {
-        if (card.dataset.collapsed === 'true' && !event.target.closest('a, button')) setCollapsed(card, item, false);
+        if (card.dataset.collapsed === 'true' && !event.target.closest('a, button, input, select, label')) setCollapsed(card, item, false);
       });
       card.dataset.collapsed = String(!expandedCards.has(item.id));
       card.querySelector('.card-toggle').setAttribute('aria-expanded', String(expandedCards.has(item.id)));
+      card.querySelector('.card-toggle').setAttribute('aria-label', expandedCards.has(item.id) ? 'Hide details' : 'Show details');
       card.dataset.status = String(item.status || 'open').toLowerCase();
       card.style.animationDelay = Math.min(index * 45, 360) + 'ms';
       fragment.querySelector('.item-id').textContent = '#' + item.id;
@@ -1123,7 +1137,7 @@ export const APP_HTML = `<!doctype html>
         if (history.open) openHistory.add(item.id); else openHistory.delete(item.id);
       });
       fillCard(card, item);
-      return fragment;
+      return card;
     }
 
     // Everything on a card that changes when someone acts on it. Called on first render and
@@ -1231,6 +1245,7 @@ export const APP_HTML = `<!doctype html>
       fillNudge(card, item);
       fillPrep(card, item);
       fillHistory(card, item);
+      decorateCard(card, item);
     }
 
     function doButton(label, onClick) {
@@ -1283,39 +1298,23 @@ export const APP_HTML = `<!doctype html>
 
     function fillOwners(card, item) {
       const row = card.querySelector('.owner-row');
-      row.querySelectorAll('.owner-chip').forEach(function (chip) { chip.remove(); });
-      const owner = String(item.assignee || '').toLowerCase();
-      const hint = item.brief ? item.brief.owner_hint : '';
-      const keys = teamList.map(function (person) { return person.key; });
-      const people = keys.indexOf(owner) < 0 && owner && owner !== 'aries' ? keys.concat([owner]) : keys;
-      people.forEach(function (person) {
-        const chip = document.createElement('button');
-        chip.type = 'button';
-        chip.className = 'owner-chip' + (person === hint ? ' suggested' : '');
-        chip.textContent = nameOf(person);
-        chip.setAttribute('aria-pressed', String(person === owner));
-        chip.title = person === owner ? nameOf(person) + ' owns this card' : 'Give this card to ' + nameOf(person);
-        chip.addEventListener('click', function () {
-          if (person === String(item.assignee || '').toLowerCase()) {
-            showToast(nameOf(person) + ' already owns this card.', false);
-            return;
-          }
-          assignTo(card, item, person, chip);
-        });
-        row.append(chip);
-      });
-      // Aries as the owner means Aries works the card itself: it reads the thread, drafts, asks
-      // teammates, and writes what it did back here. It never sends outside the company.
-      const aries = document.createElement('button');
-      aries.type = 'button';
-      aries.className = 'owner-chip aries';
-      aries.dataset.action = 'assign-aries';
-      aries.setAttribute('aria-pressed', String(owner === 'aries'));
-      aries.textContent = owner === 'aries' ? '♈ Aries has it: add an instruction' : '♈ Assign to Aries';
-      aries.title = 'Aries works this card: reads the email, drafts replies, asks teammates, and notes what it did. It never sends outside the company.';
-      aries.addEventListener('click', function () { openAriesDialog(card, item, 'assign'); });
-      row.append(aries);
-      card.querySelector('.owner-hint').textContent = hint && hint !== owner ? 'Aries suggests ' + nameOf(hint) + '.' : '';
+      let select = row.querySelector('select');
+      if (!select) {
+        select = document.createElement('select'); select.className = 'owner-select';
+        select.setAttribute('aria-label','Owner for card #'+item.id);
+        select.addEventListener('change',function () {
+          if (select.value === 'aries') { openAriesDialog(card,item,'assign'); select.value=String(item.assignee||'').toLowerCase(); }
+          else assignTo(card,item,select.value,select);
+        }); row.append(select);
+      }
+      if (document.activeElement !== select) {
+        const owner=String(item.assignee||'').toLowerCase();
+        const people=[{key:'',name:'Unassigned'}].concat(teamList,[{key:'aries',name:'Aries (delegate work)'}]);
+        if(owner && !people.some(function(person){return person.key===owner;}))people.push({key:owner,name:nameOf(owner)});
+        select.replaceChildren();people.forEach(function(person){select.append(new Option(person.name,person.key));});select.value=owner;
+      }
+      const hint=(item.brief||{}).owner_hint;
+      card.querySelector('.owner-hint').textContent=hint && hint!==item.assignee?'Suggested owner: '+nameOf(hint)+'. Preparation is separate below.':'Owner is accountable. Preparation by Aries keeps this owner.';
     }
 
     function fillHistory(card, item) {
@@ -1381,10 +1380,8 @@ export const APP_HTML = `<!doctype html>
         back.textContent = 'Bring back now';
         back.addEventListener('click', function (event) {
           submitAction(event.currentTarget, { operation: 'reopen', id: item.id }, function () {
-            item.status = 'open';
-            item.due = '';
-            addHistory(item, 'reopened it');
-            render(boardItems);
+            addHistory(item, 'requested reopening');
+            back.textContent = commandReceiptText(item.command_receipt);
           }, 'Back on the board.');
         });
         row.append(text, back);
@@ -1522,7 +1519,7 @@ export const APP_HTML = `<!doctype html>
         addHistory(item, 'asked Aries to prep it for ' + nameOf(owner));
         ariesDialog.close();
         if (card.isConnected) fillCard(card, item);
-        showToast('Aries is prepping this for ' + nameOf(owner) + '. It writes what it prepared on the card and emails ' + nameOf(owner) + '.', false);
+        showToast(commandReceiptText(item.command_receipt)+'. Preparation has been requested.', false);
       } catch (error) {
         showToast(error.message || 'Could not start the prep', true);
       } finally {
@@ -1542,12 +1539,11 @@ export const APP_HTML = `<!doctype html>
           addHistory(item, 'wrote: For Aries: ' + instruction);
         }
         await postAction({ operation: 'assign', id: item.id, value: 'aries' });
-        item.assignee = 'aries';
-        addHistory(item, 'assigned it to Aries');
+        addHistory(item, 'requested assignment to Aries');
         ariesDialog.close();
         if (card.isConnected) fillCard(card, item);
         refreshBoardChrome();
-        showToast('Aries has it. It starts within a few minutes and writes what it did on the card.', false);
+        showToast(commandReceiptText(item.command_receipt)+'. Awaiting application by Aries.', false);
       } catch (error) {
         showToast(error.message || 'Could not give it to Aries', true);
       } finally {
@@ -1630,16 +1626,16 @@ export const APP_HTML = `<!doctype html>
         row.append(choice('\u{1F44E} Not a task', function (button) {
           if (!window.confirm('Tell Aries to stop making tasks out of emails like this one?\\n\\n' + item.title)) return;
           submitAction(button, { operation: 'not_useful', id: item.id }, function () {
-            boardItems = boardItems.filter(function (row) { return row.id !== item.id; });
-            card.remove();
+            closeChoices(card);
+            fillCard(card, item);
             refreshBoardChrome();
           });
         }));
         row.append(choice('Delete', function (button) {
           if (!window.confirm('Delete #' + item.id + ' permanently? ' + item.title)) return;
           submitAction(button, { operation: 'delete', id: item.id }, function () {
-            boardItems = boardItems.filter(function (row) { return row.id !== item.id; });
-            card.remove();
+            closeChoices(card);
+            fillCard(card, item);
             refreshBoardChrome();
           });
         }, true));
@@ -1656,8 +1652,7 @@ export const APP_HTML = `<!doctype html>
           ? 'Assigned to ' + nameOf(person) + '. Aries emails ' + nameOf(person) + ' about it.'
           : 'Owner cleared.';
       submitAction(button, { operation: 'assign', id: item.id, value: person }, function () {
-        item.assignee = person;
-        addHistory(item, person ? 'assigned it to ' + nameOf(person) : 'cleared the owner');
+        addHistory(item, person ? 'requested assignment to ' + nameOf(person) : 'requested clearing the owner');
         closeChoices(card);
         if (!inView(item)) card.remove();
         else fillCard(card, item);
@@ -1667,9 +1662,7 @@ export const APP_HTML = `<!doctype html>
 
     function snoozeTo(card, item, day, button) {
       submitAction(button, { operation: 'snooze', id: item.id, value: day }, function () {
-        item.due = day;
-        item.status = 'snoozed';
-        addHistory(item, 'snoozed it to ' + monthDay(day));
+        addHistory(item, 'requested snooze to ' + monthDay(day));
         closeChoices(card);
         if (isResting(item)) {
           card.remove();
@@ -1687,11 +1680,10 @@ export const APP_HTML = `<!doctype html>
       try {
         await postAction({ operation: 'note', id: item.id, note: 'Done: ' + reason + '.' });
         await postAction({ operation: 'done', id: item.id });
-        item.status = 'done';
-        card.remove();
+        closeChoices(card);
+        fillCard(card, item);
         refreshBoardChrome();
-        renderChecked();
-        showToast('Marked done: ' + reason + '.', false);
+        showToast(commandReceiptText(item.command_receipt)+'. Completion requested: '+reason+'.', false);
       } catch (error) {
         button.disabled = false;
         showToast(error.message || 'Could not mark it done', true);
@@ -1704,10 +1696,9 @@ export const APP_HTML = `<!doctype html>
       try {
         await postAction({ operation: 'note', id: item.id, note: 'Still waiting on ' + who + '. Check again ' + monthDay(day) + '.' });
         await postAction({ operation: 'snooze', id: item.id, value: day });
-        item.due = day;
-        addHistory(item, 'noted it is still waiting on ' + who);
+        addHistory(item, 'requested a check on ' + monthDay(day) + ' while waiting on ' + who);
         fillCard(card, item);
-        showToast('Snoozed to ' + monthDay(day) + ' with a note.', false);
+        showToast(commandReceiptText(item.command_receipt)+'. Return date requested: '+monthDay(day)+'.', false);
       } catch (error) {
         button.disabled = false;
         showToast(error.message || 'Could not mark it waiting', true);
@@ -1787,8 +1778,13 @@ export const APP_HTML = `<!doctype html>
       failed: ['Aries prep failed', 'failed'],
     };
 
+    let currentTodos = [];
     function renderTodos(items) {
-      todoList.replaceChildren();
+      currentTodos = items;
+      const restoreFocus=rememberFocus();
+      const existingTodos=new Map(Array.from(todoList.querySelectorAll('[data-task-id]')).map(function(row){return [row.dataset.taskId,row];}));
+      const nextTodoNodes=[];
+      if(!items.length)todoList.replaceChildren();
       items = items.slice().sort(function (left, right) { return Number(todoUrgent(right)) - Number(todoUrgent(left)); });
       if (!items.length) {
         const empty = document.createElement('div');
@@ -1804,6 +1800,8 @@ export const APP_HTML = `<!doctype html>
       items.forEach(function (item) {
         const row = document.createElement('article');
         row.className = 'todo-row';
+        row.dataset.taskId=String(item.id);
+        row.dataset.signature=JSON.stringify(item);
         row.dataset.done = String(Boolean(item.done));
         row.dataset.archived = String(Boolean(item.archived));
         row.dataset.urgent = String(todoUrgent(item) && !item.done);
@@ -1816,7 +1814,7 @@ export const APP_HTML = `<!doctype html>
         toggle.textContent = item.done ? '✓' : '○';
         toggle.addEventListener('click', function () {
           toggle.disabled = true;
-          submitTodoAction(item.id, 'toggle', { done: !item.done }).catch(function (error) {
+          submitTodoAction(item.id, 'toggle', { done: !(currentTodos.find(function(current){return current.id===item.id;})||item).done }).catch(function (error) {
             showToast(error.message || 'Unable to update task', true);
             toggle.disabled = false;
           });
@@ -1901,9 +1899,13 @@ export const APP_HTML = `<!doctype html>
           actions.append(source);
         }
         row.append(toggle, copy, actions);
-        todoList.append(row);
+        const previous=existingTodos.get(String(item.id));
+        nextTodoNodes.push(previous && (previous.dataset.signature===row.dataset.signature || (previous.contains(document.activeElement) && !previous.querySelector(':disabled'))) ? previous : row);
       });
+      if(items.length)reconcileChildren(todoList,nextTodoNodes);
       todoList.setAttribute('aria-busy', 'false');
+      restoreFocus();
+      handleTodoLink();
     }
 
     async function loadTodos() {
@@ -1915,7 +1917,9 @@ export const APP_HTML = `<!doctype html>
         setFreshness(payload);
         todoSyncStatus.textContent = payload.stale && payload.stale.is_stale
           ? 'Last known list. Aries has not refreshed it in the last few minutes.'
-          : 'Up to date with the board.';
+          : 'Catalogue snapshot received. Source tasks may have older evidence.';
+        const catalogue=Array.isArray(payload.items)?payload.items:[];
+        todoSyncStatus.textContent += ' '+catalogue.length+' catalogue tasks, '+catalogue.filter(function(item){return !item.done;}).length+' open. This is a separate collection from Board.';
         renderTodos(Array.isArray(payload.items) ? payload.items : []);
       } catch (error) {
         stateBadge.className = 'state-badge offline';
@@ -1932,14 +1936,16 @@ export const APP_HTML = `<!doctype html>
       const showingChecked = view === 'checked';
       const showingUsers = view === 'users';
       const showingMine = view === 'mine';
-      const showingBoard = !showingTodos && !showingWorklist && !showingChecked && !showingUsers && !showingMine;
+      const showingExceptions = view === 'exceptions';
+      document.querySelector('#show-exceptions').setAttribute('aria-pressed', String(showingExceptions));
+      const showingBoard = !showingExceptions && !showingTodos && !showingWorklist && !showingChecked && !showingUsers && !showingMine;
       boardFilter = showingMine ? 'mine' : 'all';
-      document.querySelector('#board-title').textContent = showingMine ? 'My cards' : 'Team attention';
+      document.querySelector('#board-title').textContent = showingExceptions ? 'Exceptions requiring review' : showingMine ? 'My cards' : 'Team attention';
       document.querySelector('#board-subtitle').textContent = showingMine && me
         ? 'Only the cards assigned to you, ' + me.name + '.'
         : 'Curated operational items from Aries.';
-      boardView.hidden = !showingBoard && !showingMine;
-      boardSummary.hidden = !showingBoard && !showingMine;
+      boardView.hidden = !showingBoard && !showingMine && !showingExceptions;
+      boardSummary.hidden = !showingBoard && !showingMine && !showingExceptions;
       showMineButton.setAttribute('aria-pressed', String(showingMine));
       todoView.hidden = !showingTodos;
       worklistView.hidden = !showingWorklist;
@@ -1993,7 +1999,7 @@ export const APP_HTML = `<!doctype html>
     }
 
     function renderChecked() {
-      const done = boardItems.filter(function (item) { return item.status === 'done'; });
+      const done = boardItems.filter(function (item) { return item.status === 'done' && !item.pending; });
       checkedList.replaceChildren();
       done.forEach(function (item) {
         const row = document.createElement('div');
@@ -2007,9 +2013,8 @@ export const APP_HTML = `<!doctype html>
         undo.textContent = 'Undo';
         undo.addEventListener('click', function (event) {
           submitAction(event.currentTarget, { operation: 'reopen', id: item.id }, function () {
-            item.status = 'open';
-            row.remove();
-            renderChecked();
+            undo.textContent = commandReceiptText(item.command_receipt);
+            undo.disabled = true;
           });
         });
         row.append(text, undo);
@@ -2214,7 +2219,12 @@ export const APP_HTML = `<!doctype html>
         if (!response.ok) throw new Error('Board request failed (' + response.status + ')');
         const payload = await response.json();
         setFreshness(payload);
-        boardItems = Array.isArray(payload.items) ? payload.items : [];
+        boardItems = reconcileBoardItems(boardItems,Array.isArray(payload.items) ? payload.items : []);
+        currentReceipts = Array.isArray(payload.command_receipts) ? payload.command_receipts : [];
+        const availableIds=new Set(boardItems.map(function(item){return String(item.id);}));
+        selectedCards.forEach(function(id){if(!availableIds.has(id)||boardItems.some(function(item){return String(item.id)===id&&item.status==='done';}))selectedCards.delete(id);});
+        cardNodes.forEach(function(node,id){if(!availableIds.has(id))cardNodes.delete(id);});
+        compactRows.forEach(function(node,id){if(!availableIds.has(id))compactRows.delete(id);});
         threadIds = new Set(Array.isArray(payload.thread_ids) ? payload.thread_ids : []);
         document.querySelector('#activity-link').hidden = payload.activity !== true;
         showUsersButton.hidden = payload.activity !== true;
@@ -2223,6 +2233,7 @@ export const APP_HTML = `<!doctype html>
         showMineButton.hidden = !me;
         render(boardItems);
         renderChecked();
+        handleBoardLink();
       } catch (error) {
         stateBadge.className = 'state-badge offline';
         stateBadge.textContent = 'Unavailable';
@@ -2255,14 +2266,17 @@ export const APP_HTML = `<!doctype html>
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Action was not queued');
-      return result.command || {};
+      const command = result.command || {};
+      const item = boardItems.find(function (row) { return row.id === payload.id; });
+      if (item) { item.command_receipt = result.receipt || command.receipt || Object.assign({},command,{state:command.state || 'queued'}); const card=cardNodes.get(String(item.id)); if(card)decorateCard(card,item); }
+      return command;
     }
 
     async function submitAction(button, payload, onAccepted, message) {
       if (button) button.disabled = true;
       try {
         const command = await postAction(payload);
-        showToast(message || ACTION_WORDING[payload.operation] || 'Queued for Aries.', false);
+        showToast(commandReceiptText((boardItems.find(function(item){return item.id===payload.id;})||{}).command_receipt), false);
         // The accepted row carries the identity Access proved and the time the worker stamped.
         // Callers render from THAT rather than guessing at either.
         if (typeof onAccepted === 'function') onAccepted(command);
@@ -2327,9 +2341,11 @@ export const APP_HTML = `<!doctype html>
     });
     showBoardButton.addEventListener('click', function () { switchView('board'); });
     showTodosButton.addEventListener('click', function () { switchView('todos'); });
-    loadBoard();
+    ${BOARD_UPGRADE_SCRIPT}
+    const initialView = new URLSearchParams(location.search).get('view');
+    if (['todos','worklist','exceptions','mine'].includes(initialView)) switchView(initialView); else loadBoard();
     window.setInterval(function () {
-      if (activeView === 'users') return;
+      if (activeView === 'users' || noteDialog.open || ariesDialog.open || bulkDialog.open) return;
       if (activeView === 'todos') loadTodos();
       else if (activeView === 'worklist') loadWorklist();
       // A card with its Done, Snooze or More choices open is mid-decision. Re-rendering the
