@@ -23,6 +23,12 @@ CREATE TABLE IF NOT EXISTS command_queue (
   created_at TEXT NOT NULL,
   acked_at TEXT,
   ack_detail TEXT,
+  received_at TEXT,
+  lease_token TEXT,
+  lease_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at TEXT,
+  error_code TEXT,
   CHECK (
     (operation = 'note' AND length(trim(note)) BETWEEN 1 AND 2000)
     OR
@@ -37,6 +43,9 @@ CREATE TABLE IF NOT EXISTS command_queue (
 
 CREATE INDEX IF NOT EXISTS command_queue_pending_idx
   ON command_queue (state, id);
+
+CREATE INDEX IF NOT EXISTS command_queue_lease_idx
+  ON command_queue (state, lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS todo_catalogue (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),

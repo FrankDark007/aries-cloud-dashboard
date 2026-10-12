@@ -1,7 +1,9 @@
 import { APP_HTML } from './ui.js'
 import { CARD_HTML } from './card-ui.js'
 import { missionRequest, checkServices } from './mission.js'
-import { claimGroups } from './claim-groups.js'
+import { claimGroupDetails } from './claim-groups.js'
+import { curateCardMetadata, enrichBoardItems } from './card-data.js'
+import { commandReceipt, commandReceipts, receiveCommands, claimCommands, acknowledgeDelivery, retryCommand } from './command-queue.js'
 
 /**
  * @typedef {object} BoardItem
@@ -297,24 +299,26 @@ function requestOrigin(request) {
  * @param {Env} env
  * @param {Request} request
  * @param {{at: string, actorEmail: string, source: 'board'|'todo', operation: string, itemId: string, value: string|null}} entry
+ * @param {boolean} [guardPreviousInsert]
  */
-function activityStatement(env, request, entry) {
+function activityStatement(env, request, entry, guardPreviousInsert = false) {
   const origin = requestOrigin(request)
   return env.DB.prepare(`
     INSERT INTO activity_log (
       at, actor_email, source, operation, item_id, value, title, ip, country, user_agent
-    ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+    ) SELECT ?, ?, ?, ?, ?, ?, COALESCE(
       (SELECT json_extract(j.value, '$.title')
          FROM board_snapshot b, json_each(b.snapshot_json, '$.items') j
         WHERE ? = 'board' AND CAST(json_extract(j.value, '$.id') AS TEXT) = ? LIMIT 1),
       (SELECT json_extract(j.value, '$.text')
          FROM todo_catalogue c, json_each(c.catalogue_json, '$.items') j
         WHERE ? = 'todo' AND json_extract(j.value, '$.id') = ? LIMIT 1)
-    ), ?, ?, ?)
+    ), ?, ?, ? WHERE ? = 1 OR changes() = 1
   `).bind(
     entry.at, entry.actorEmail, entry.source, entry.operation, entry.itemId, entry.value,
     entry.source, entry.itemId, entry.source, entry.itemId,
     origin.ip, origin.country, origin.userAgent,
+    guardPreviousInsert ? 0 : 1,
   )
 }
 
@@ -476,7 +480,30 @@ function curateTaskState(value, owners) {
     if (typeof source.for !== 'string' || !owners.has(source.for)) return null
     state.for = source.for
   }
+  for (const field of ['output', 'result', 'detail', 'error']) {
+    if (typeof source[field] === 'string') state[field] = source[field].slice(0, 6000)
+  }
+  const attachments = boardAttachments(source.attachments)
+  if (attachments.length) state.attachments = attachments
   return state
+}
+
+/** Only explicit document links cross the publisher boundary. @param {unknown} value */
+function boardAttachments(value) {
+  /** @type {{name:string,url:string}[]} */
+  const result = []
+  if (!Array.isArray(value)) return result
+  for (const entry of value.slice(0, 20)) {
+    if (!entry || typeof entry !== 'object') continue
+    const name = entry.name || entry.filename
+    const raw = entry.url || entry.href
+    if (typeof name !== 'string' || typeof raw !== 'string' || raw.length > 2048) continue
+    try {
+      const url = new URL(raw)
+      if (url.protocol === 'https:' && !url.username && !url.password) result.push({name:name.slice(0,240),url:url.href})
+    } catch { /* Invalid attachment links are omitted. */ }
+  }
+  return result
 }
 
 /**
@@ -493,7 +520,7 @@ function curateItem(item, tally, owners = DEFAULT_BRIEF_OWNERS) {
   if (!title || title.length > STRING_LIMITS.title) return null
   if (typeof source.kind === 'string' && source.kind.trim().toLowerCase() === 'personal') return null
 
-  /** @type {Record<string, string|number>} */
+  /** @type {Record<string, any>} */
   const curated = { id: /** @type {number} */ (source.id), title }
   for (const [field, limit] of Object.entries(STRING_LIMITS)) {
     if (field === 'title' || source[field] === undefined || source[field] === null) continue
@@ -524,6 +551,9 @@ function curateItem(item, tally, owners = DEFAULT_BRIEF_OWNERS) {
     const state = curateTaskState(source[field], owners)
     if (state) /** @type {Record<string, unknown>} */ (curated)[field] = state
   }
+  Object.assign(curated, curateCardMetadata(source))
+  const attachments = boardAttachments(source.attachments)
+  if (attachments.length) curated.attachments = attachments
   return /** @type {BoardItem} */ (curated)
 }
 
@@ -1177,34 +1207,35 @@ function applyPendingCommands(items, commands) {
     if (!item) continue
     if (command.operation === 'done') {
       item.status = 'done'
-      item.pending = true
+      item.pending = command.state !== 'applied'
     } else if (command.operation === 'reopen') {
       item.status = 'open'
-      item.pending = true
+      item.pending = command.state !== 'applied'
     } else if (command.operation === 'delete' || command.operation === 'not_useful') {
-      dropped.add(command.item_id)
+      if (command.state === 'applied') dropped.add(command.item_id)
+      else item.pending = true
     } else if (command.operation === 'assign') {
       item.assignee = command.value || ''
-      item.pending = true
+      item.pending = command.state !== 'applied'
     } else if (command.operation === 'snooze') {
       item.due = command.value || item.due
       item.status = 'snoozed'
-      item.pending = true
+      item.pending = command.state !== 'applied'
     } else if (command.operation === 'urgent') {
       if (command.value === 'on') item.urgent = command.created_at
       else delete item.urgent
-      item.pending = true
+      item.pending = command.state !== 'applied'
     } else if (command.operation === 'note' && command.note) {
       const notes = Array.isArray(item.notes) ? item.notes.slice() : []
       notes.push({
         text: command.note,
         by: command.actor_email || '',
         at: command.created_at || '',
-        pending: true,
+        pending: command.state !== 'applied',
       })
       item.notes = notes
       item.note = command.note
-      item.pending = true
+      item.pending = command.state !== 'applied'
     }
   }
   return order.filter((id) => !dropped.has(id)).map((id) => byId.get(id))
@@ -1392,6 +1423,7 @@ function cardHistory(item, actions, names) {
     .slice(0, HISTORY_PER_CARD)
 }
 
+/** @param {Request} request @param {Env} env */
 async function getBoard(request, env) {
   if (request.method !== 'GET') return methodNotAllowed('GET')
   const row = /** @type {SnapshotRow|null} */ (await env.DB.prepare(`
@@ -1427,21 +1459,26 @@ async function getBoard(request, env) {
   // made from an email, and for others the mailbox could not be resolved so nothing was
   // rendered. Without this the UI offered "Open email" on every card and a third of them
   // answered "No source email for this item" -- a button that exists only to apologise.
-  const threadRows = await env.DB.prepare('SELECT item_id FROM board_threads').all()
+  const threadRows = await env.DB.prepare("SELECT item_id, json_extract(thread_json, '$.subject') AS source_subject FROM board_threads").all()
   const threadIds = (threadRows.results || []).map((entry) => entry.item_id)
+  const subjects = new Map((threadRows.results || []).map(entry => [entry.item_id, entry.source_subject]))
 
   // Keep a checked-off card checked off while Aries catches up, including the short
   // interval between acknowledgement and the next snapshot. A newer snapshot wins.
   // Everything a teammate has clicked since the last publish is still sitting in the queue.
   // It has to be folded in here, or the board answers every poll with the pre-click state.
-  const completionPending = await completionCommands(env, row.published_at)
+  const receipts = await commandReceipts(env.DB)
   const pendingRows = await env.DB.prepare(`
-    SELECT operation, item_id, note, value, actor_email, created_at
+    SELECT operation, item_id, note, value, actor_email, created_at, state
     FROM command_queue
-    WHERE state = 'queued'
+    WHERE state = 'queued' OR (state = 'applied' AND acked_at > ?)
     ORDER BY id
-  `).all()
-  const items = applyPendingCommands(applyCompletionCommands(snapshot.items, completionPending), pendingRows.results || [])
+  `).bind(row.published_at).all()
+  const items = enrichBoardItems(applyPendingCommands(snapshot.items, pendingRows.results || []).map(item => ({ ...item, source_subject: subjects.get(item.id) || null })))
+  for (const item of items) delete item.source_subject
+  const latestReceipts = new Map()
+  for (const receipt of receipts) if (!latestReceipts.has(receipt.item_id)) latestReceipts.set(receipt.item_id, receipt)
+  for (const item of items) item.command_receipt = latestReceipts.get(item.id) || null
 
   // Board actions from the audit trail, grouped per card, for each card's history.
   const since = new Date(Date.now() - HISTORY_DAYS * 86400000).toISOString()
@@ -1466,17 +1503,20 @@ async function getBoard(request, env) {
   }
 
   // Cards for the same client or claim number, so the board can show them as one claim card.
-  const groups = claimGroups(items, { staff: team.flatMap((member) => [member.key, member.name]) })
+  const { groups, conflicts } = claimGroupDetails(items, { staff: team.flatMap((member) => [member.key, member.name]) })
   for (const item of items) {
+    item.group_conflicts = conflicts.get(item.id) || []
     const group = groups.get(item.id)
     if (!group) continue
     item.claim_group = group.key
     item.claim_label = group.label
+    item.grouping = group
   }
 
   return json({
     items,
     thread_ids: threadIds,
+    command_receipts: receipts,
     activity: isActivityOwner(request, env),
     // Names only: the owner chips and every "Nudge Mark" label read from this.
     team: team.map((member) => ({ key: member.key, name: member.name })),
@@ -1827,14 +1867,51 @@ async function queueAction(request, env, actorEmail) {
     value = String(action.value)
   }
 
+  /** @type {{command_id:number,assignee:string,due:string,status:string}|null} */
+  let expected = null
+  let generation = null
+  let deliveryState = ''
+  if (action.expected !== undefined) {
+    const candidate = /** @type {any} */ (action.expected)
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
+      || !Number.isSafeInteger(candidate.command_id) || candidate.command_id < 0
+      || !['assignee', 'due', 'status'].every(key => typeof candidate[key] === 'string')) {
+      return badRequest('Invalid expected card state')
+    }
+    expected = candidate
+    const boardResponse = await getBoard(new Request(request.url, { headers: request.headers }), env)
+    if (!boardResponse.ok) return boardResponse
+    const board = /** @type {any} */ (await boardResponse.json())
+    const current = board.items.find((/** @type {any} */ item) => item.id === action.id)
+    if (!current || (current.command_receipt?.id || 0) !== candidate.command_id
+      || (current.assignee || '') !== candidate.assignee || (current.due || '') !== candidate.due
+      || (current.status || 'open') !== candidate.status) {
+      return json({ error: 'Card changed since this preview. Refresh and review it again.' }, 409)
+    }
+    generation = board.published_at
+    deliveryState = current.command_receipt?.state || ''
+  }
   const createdAt = new Date().toISOString()
-  // The command and its audit row land together or not at all.
+  // The command and its audit row land together or not at all. A guarded insert also
+  // fences changes arriving between the preview check and this transaction.
+  const insertStatement = expected ? env.DB.prepare(`
+    INSERT INTO command_queue (operation, item_id, note, value, actor_email, state, created_at)
+    SELECT ?, ?, ?, ?, ?, 'queued', ?
+    WHERE COALESCE((SELECT MAX(id) FROM command_queue WHERE item_id = ?), 0) = ?
+      AND (SELECT published_at FROM board_snapshot WHERE singleton_id = 1) = ?
+      AND COALESCE((SELECT CASE
+        WHEN state != 'queued' THEN state
+        WHEN lease_token IS NOT NULL THEN 'processing'
+        WHEN received_at IS NOT NULL THEN 'received'
+        ELSE 'queued' END FROM command_queue WHERE id = ?), '') = ?
+  `).bind(action.operation, action.id, note, value, actorEmail, createdAt, action.id, expected.command_id, generation, expected.command_id, deliveryState)
+    : env.DB.prepare(`
+      INSERT INTO command_queue (operation, item_id, note, value, actor_email, state, created_at)
+      VALUES (?, ?, ?, ?, ?, 'queued', ?)
+    `).bind(action.operation, action.id, note, value, actorEmail, createdAt)
+
   const [inserted] = await env.DB.batch([
-    env.DB.prepare(`
-      INSERT INTO command_queue (
-        operation, item_id, note, value, actor_email, state, created_at
-      ) VALUES (?, ?, ?, ?, ?, 'queued', ?)
-    `).bind(action.operation, action.id, note, value, actorEmail, createdAt),
+    insertStatement,
     activityStatement(env, request, {
       at: createdAt,
       actorEmail,
@@ -1842,8 +1919,9 @@ async function queueAction(request, env, actorEmail) {
       operation: String(action.operation),
       itemId: String(action.id),
       value: note ?? value,
-    }),
+    }, Boolean(expected)),
   ])
+  if (!inserted.meta.changes) return json({ error: 'Card changed since this preview. Refresh and review it again.' }, 409)
   const command = {
     id: inserted.meta.last_row_id,
     operation: action.operation,
@@ -1853,7 +1931,7 @@ async function queueAction(request, env, actorEmail) {
     actor_email: actorEmail,
     created_at: createdAt,
   }
-  return json({ ok: true, command }, 202)
+  return json({ ok: true, command, receipt: commandReceipt({ ...command, state: 'queued' }) }, 202)
 }
 
 /**
@@ -2020,17 +2098,20 @@ function commandLimit(url) {
  * @returns {Promise<Response>}
  */
 async function listCommands(request, env, url) {
-  if (request.method !== 'GET') return methodNotAllowed('GET')
+  if (request.method === 'POST') {
+    if (!hasJsonContentType(request)) return unsupportedMediaType()
+    const body = /** @type {JsonObject|null} */ (await readJson(request))
+    if (!body || !isObject(body)) return badRequest('Invalid lease request')
+    const limit = body.limit ?? 50, seconds = body.lease_seconds ?? 300
+    if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 100 || typeof seconds !== 'number' || !Number.isSafeInteger(seconds) || seconds < 30 || seconds > 900) return badRequest('Invalid lease limit or duration')
+    const commands = await claimCommands(env.DB, limit, seconds)
+    return json({ commands, count: commands.length })
+  }
+  if (request.method !== 'GET') return methodNotAllowed('GET, POST')
   const limit = commandLimit(url)
   if (limit === null) return badRequest('Invalid limit')
-  const queued = await env.DB.prepare(`
-    SELECT id, operation, item_id, note, value, actor_email, created_at
-    FROM command_queue
-    WHERE state = 'queued'
-    ORDER BY id ASC
-    LIMIT ?
-  `).bind(limit).all()
-  return json({ commands: queued.results, count: queued.results.length })
+  const commands = await receiveCommands(env.DB, limit)
+  return json({ commands, count: commands.length })
 }
 
 /**
@@ -2080,14 +2161,8 @@ async function acknowledgeCommand(request, env, commandId) {
     detail = acknowledgement.detail.trim()
     if (detail.length > 2000) return badRequest('Invalid detail')
   }
-  const ackedAt = new Date().toISOString()
-  const updated = await env.DB.prepare(`
-    UPDATE command_queue
-    SET state = ?, ack_detail = ?, acked_at = ?
-    WHERE id = ? AND state = 'queued'
-  `).bind(acknowledgement.status, detail, ackedAt, commandId).run()
-  if (updated.meta.changes !== 1) return missing('Command not found')
-  return json({ ok: true, id: commandId, status: acknowledgement.status, acked_at: ackedAt })
+  const result = await acknowledgeDelivery(env.DB, commandId, acknowledgement.status, detail, acknowledgement.lease_token)
+  return json(result, result.error ? Number(result.status) : 200)
 }
 
 /**
@@ -2348,6 +2423,28 @@ async function saveTeamMember(request, env, actorEmail) {
   return json({ ok: true, key, changed: true, ...teamPayload(await loadTeam(env)) })
 }
 
+/** @param {Env} env */
+async function operationalHealth(env) {
+  const now = Date.now(), threshold = staleAfterSeconds(env)
+  const definitions = [ ['board', 'board_snapshot'], ['todos', 'todo_catalogue'], ['full_list', 'worklist_snapshot'] ]
+  const sources = await Promise.all(definitions.map(async ([name, table]) => {
+    const row = await env.DB.prepare(`SELECT published_at FROM ${table} WHERE singleton_id = 1`).first()
+    const at = row && typeof row.published_at === 'string' ? row.published_at : null
+    const time = at ? Date.parse(at) : NaN
+    const age = Number.isFinite(time) ? Math.max(0, (now - time) / 1000) : null
+    return { name, status: age === null || time > now + 60000 ? 'unknown' : age > threshold ? 'stale' : 'current', last_evidence_at: at, age_seconds: age, after_seconds: threshold }
+  }))
+  await commandReceipts(env.DB)
+  const counts = await env.DB.prepare(`SELECT
+    COALESCE(SUM(state = 'queued'),0) AS pending,
+    COALESCE(SUM(state = 'failed'),0) AS failed,
+    COALESCE(SUM(state = 'queued' AND created_at < ?),0) AS stuck FROM command_queue`
+  ).bind(new Date(now - 300000).toISOString()).first()
+  const queue = { pending: Number(counts?.pending || 0), failed: Number(counts?.failed || 0), stuck: Number(counts?.stuck || 0) }
+  return { status: sources.every(s => s.status === 'current') && !queue.failed && !queue.stuck ? 'healthy' : 'degraded',
+    checked_at: new Date(now).toISOString(), sources, queue }
+}
+
 /**
  * @param {Request} request
  * @param {Env} env
@@ -2361,6 +2458,8 @@ export async function handleRequest(request, env) {
 
   if (host !== UI_HOST && host !== SYNC_HOST) return notFound()
   if (url.pathname === '/healthz' && request.method === 'GET') {
+    const missionAuth = env.MISSION_TOKEN && await constantTimeEqual(request.headers.get('authorization') || '', 'Bearer ' + env.MISSION_TOKEN)
+    if (allowedEmail(request, env) || await validPublisher(request, env) || missionAuth) return json({ ok: true, operational: await operationalHealth(env) })
     return json({ ok: true })
   }
 
@@ -2377,9 +2476,21 @@ export async function handleRequest(request, env) {
       if (request.method === 'POST') return saveTeamMember(request, env, ownerEmail)
       return methodNotAllowed('GET, POST')
     }
-    if (!UI_PATHS.has(url.pathname)) return notFound()
+    const retryMatch = url.pathname.match(/^\/api\/commands\/(\d+)\/retry$/)
+    if (!UI_PATHS.has(url.pathname) && !retryMatch) return notFound()
     const actorEmail = allowedEmail(request, env)
     if (!actorEmail) return forbidden()
+    if (retryMatch) {
+      if (request.method !== 'POST') return methodNotAllowed('POST')
+      if (!hasJsonContentType(request)) return unsupportedMediaType()
+      const body = /** @type {JsonObject|null} */ (await readJson(request))
+      if (!body || !isObject(body) || body.confirm !== true) return badRequest('Confirm source was checked before retrying')
+      const id = Number(retryMatch[1])
+      if (!Number.isSafeInteger(id) || id <= 0) return badRequest('Invalid command id')
+      const result = await retryCommand(env.DB, id)
+      if (result.ok) await activityStatement(env, request, {at: new Date().toISOString(), actorEmail, source:'board',operation:'retry',itemId:String(result.receipt.item_id),value:String(id)}).run()
+      return json(result, result.error ? Number(result.status) : 202)
+    }
     if (url.pathname === '/') {
       if (request.method !== 'GET') return methodNotAllowed('GET')
       return appHtml()

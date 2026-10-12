@@ -175,7 +175,9 @@ test('a checked-off card can be brought back, and reopen takes no argument', asy
       headers: { authorization: 'Bearer test-publisher-token' },
     }), env, {})
   const rows = (await after.json()).commands
-  assert.equal(rows[1].value, null, 'reopen must never carry a value')
+  assert.equal(rows.length, 1, 'an already received command is not delivered twice')
+  assert.equal(rows[0].item_id, 42)
+  assert.equal(rows[0].value, null, 'reopen must never carry a value')
 })
 
 test('a checked-off card is published so it can be undone, but stays off the open board', async () => {

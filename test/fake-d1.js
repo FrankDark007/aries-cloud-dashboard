@@ -53,14 +53,21 @@ class FakeD1Statement {
   }
 
   async all() {
+    if(this.query.startsWith('update command_queue set received_at = ?')) {
+      const [at,expires,max,now,limit]=this.values
+      const rows=this.database.commands.filter(c=>c.state==='queued'&&!c.lease_token&&!c.received_at&&(c.attempts||0)<max&&(!c.next_attempt_at||c.next_attempt_at<=now)).sort((a,b)=>a.id-b.id).slice(0,limit)
+      for(const c of rows)Object.assign(c,{received_at:at,lease_expires_at:expires,attempts:(c.attempts||0)+1})
+      return result(rows.map(c=>({...c})),rows.length)
+    }
+    if (this.query === 'select * from command_queue order by id desc limit 1000') return result(this.database.commands.slice().sort((a,b)=>b.id-a.id).slice(0,1000).map(c=>({...c})))
     if (this.query.includes('from command_queue') && this.query.includes("state = 'applied'")) {
-      return result(this.database.commands.filter((c) => ['done', 'reopen', 'delete'].includes(c.operation) && (c.state === 'queued' || (c.state === 'applied' && c.acked_at > this.values[0]))).sort((a, b) => a.id - b.id).map((c) => ({ ...c })))
+      return result(this.database.commands.filter((c) => (!this.query.includes("where operation in") || ['done', 'reopen', 'delete'].includes(c.operation)) && (c.state === 'queued' || (c.state === 'applied' && c.acked_at > this.values[0]))).sort((a, b) => a.id - b.id).map((c) => ({ ...c })))
     }
     if (this.query.includes('from command_queue') && this.query.includes("state = 'queued'")) {
       // The board read folds in every queued command and binds no limit; the sync read binds one.
-      const limit = this.values.length ? Number(this.values[0]) : Infinity
+      const limit = this.values.length ? Number(this.values.at(-1)) : Infinity
       const rows = this.database.commands
-        .filter((command) => command.state === 'queued')
+        .filter((command) => command.state === 'queued' && (!this.query.includes('lease_token is null') || !command.lease_token) && (!this.query.includes('next_attempt_at') || !command.next_attempt_at || command.next_attempt_at <= this.values[0]))
         .sort((left, right) => left.id - right.id)
         .slice(0, limit)
         .map(({ id, operation, item_id, note, value, actor_email, created_at }) => ({
@@ -112,7 +119,7 @@ class FakeD1Statement {
     // Which cards have a rendered email chain. The board serves this so the UI can offer
     // "Open email" only where there is one to open.
     if (this.query.includes('from board_threads')) {
-      return result([...this.database.threads.keys()].map((item_id) => ({ item_id })))
+      return result([...this.database.threads].map(([item_id,row]) => ({ item_id, source_subject: JSON.parse(row.thread_json).subject })))
     }
     throw new Error(`Unsupported D1 all(): ${this.query}`)
   }
@@ -229,6 +236,24 @@ class FakeD1Statement {
       return result([], 1, this.database.teamChanges.length)
     }
 
+    if (this.query.startsWith('update command_queue') && this.query.includes("error_code = 'lease_expired'")) {
+      let changes=0
+      for(const c of this.database.commands) if(c.state==='queued'&&c.lease_expires_at&&c.lease_expires_at<=this.values[1]) {Object.assign(c,{state:'failed',error_code:'lease_expired',acked_at:this.values[0],ack_detail:'Processing lease expired. Check the source before retrying.'});changes++}
+      return result([],changes)
+    }
+    if (this.query.startsWith('update command_queue') && this.query.includes('received_at = coalesce')) {
+      const c=this.database.commands.find(c=>c.id===this.values[1]&&c.state==='queued'&&!c.lease_token)
+      if(!c)return result([],0)
+      if(!c.received_at){c.received_at=this.values[0];c.attempts=(c.attempts||0)+1}
+      return result([],1)
+    }
+    if (this.query.startsWith('update command_queue') && this.query.includes('next_attempt_at = ?')) {
+      const [state,detail,acked_at,error_code,next_attempt_at,id,token]=this.values
+      const c=this.database.commands.find(c=>c.id===id&&c.state==='queued'&&(!c.lease_token||c.lease_token===token))
+      if(!c)return result([],0)
+      Object.assign(c,{state,ack_status:state,ack_detail:detail,acked_at,error_code,next_attempt_at})
+      return result([],1)
+    }
     if (this.query.startsWith('update command_queue')) {
       const [state, detail, acked_at, id] = this.values
       const command = this.database.commands.find((candidate) => candidate.id === Number(id))

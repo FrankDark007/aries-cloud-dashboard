@@ -6,6 +6,10 @@ import { FakeD1Database } from './fake-d1.js'
 
 const UI_HOST = 'aries.flood.doctor'
 const SYNC_HOST = 'aries-publish.flood.doctor'
+// Assert the original publisher contract independently of the added server metadata.
+function legacyItems(items) {
+  return items.map(({identity,quality,responsibility,financials,relationships,command_receipt,group_conflicts,...legacy})=>legacy)
+}
 
 function settings(db) {
   return {
@@ -67,7 +71,7 @@ test('publishes a curated snapshot and serves it to an authenticated teammate', 
   assert.equal(payload.published_at, published.published_at)
   assert.equal(payload.stale.is_stale, false)
   assert.equal(payload.stale.after_seconds, 300)
-  assert.deepEqual(payload.items, [{
+  assert.deepEqual(legacyItems(payload.items), [{
     id: 41,
     title: 'Review carrier estimate',
     summary: 'Coverage decision is ready for review.',
@@ -79,6 +83,9 @@ test('publishes a curated snapshot and serves it to an authenticated teammate', 
     note: 'Confirm depreciation line.',
     updated: '2026-08-24T12:00:00Z',
   }])
+  assert.equal(payload.items[0].responsibility.owner, 'Mark')
+  assert.equal(payload.items[0].quality.status, 'unverified')
+  assert.deepEqual(payload.items[0].financials, [])
   assert.equal(Object.hasOwn(payload.items[0], 'msg_id'), false)
   assert.equal(Object.hasOwn(payload.items[0], 'account'), false)
 })
@@ -90,7 +97,7 @@ test('serves a stale last-known snapshot when Aries is offline', async () => {
   const board = await worker.fetch(uiRequest('/api/board'), settings(db), {})
   assert.equal(board.status, 200)
   const payload = await board.json()
-  assert.deepEqual(payload.items, [{ id: 7, title: 'Last-known assignment' }])
+  assert.deepEqual(legacyItems(payload.items), [{ id: 7, title: 'Last-known assignment' }])
   assert.equal(payload.published_at, '2026-01-01T00:00:00.000Z')
   assert.equal(payload.stale.is_stale, true)
   assert.ok(payload.stale.age_seconds > 300)
@@ -108,7 +115,7 @@ test('rejects malformed snapshots without replacing the last-known board', async
 
   const board = await worker.fetch(uiRequest('/api/board'), settings(db), {})
   const payload = await board.json()
-  assert.deepEqual(payload.items, [{ id: 7, title: 'Keep me' }])
+  assert.deepEqual(legacyItems(payload.items), [{ id: 7, title: 'Keep me' }])
 })
 
 test('fails closed when a snapshot contains a personal item', async () => {
