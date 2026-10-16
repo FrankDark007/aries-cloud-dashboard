@@ -1,4 +1,4 @@
-import { cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems } from './board-ui-state.js'
+import { isAutoResolvedCandidate, isStaleCard, cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems } from './board-ui-state.js'
 
 export const BOARD_UPGRADE_CSS = `
     .summary-strip { padding: 12px 18px; margin-bottom: 16px; }
@@ -72,7 +72,7 @@ export const BOARD_UPGRADE_DIALOGS = `
   <dialog id="bulk-dialog" aria-labelledby="bulk-title"><div class="dialog-body"><h2 id="bulk-title">Review bulk action</h2><p>Only the listed cards will change. Each command keeps its own receipt.</p><div class="bulk-fields"><label>Action<select id="bulk-operation"><option value="assign">Assign owner</option><option value="snooze">Snooze</option><option value="duplicate-review">Request duplicate review</option></select></label><label id="bulk-owner-label">New owner<select id="bulk-owner"></select></label><label id="bulk-date-label" hidden>Return date<input id="bulk-date" type="date"></label></div><ol id="bulk-preview"></ol><p id="bulk-help"></p><div class="dialog-actions"><button id="bulk-cancel" class="dialog-action" type="button">Cancel</button><button id="bulk-confirm" class="dialog-action primary" type="button">Queue these changes</button></div></div></dialog>
 `
 
-export const BOARD_UPGRADE_SCRIPT = [cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems].map(fn => fn.toString()).join('\n') + String.raw`
+export const BOARD_UPGRADE_SCRIPT = [isAutoResolvedCandidate, isStaleCard, cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems].map(fn => fn.toString()).join('\n') + String.raw`
     const filters = { query:'', owner:'', client:'', claim:'', urgency:'', due:'', status:'', sort:'urgent' };
     const selectedCards = new Set();
     const cardNodes = new Map();
