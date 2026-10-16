@@ -2,7 +2,8 @@
 // consolidate the cards and list all open tasks for that claim under the same card."
 // Aries opens a card per email thread, so one claim collects a card for every thread about
 // it. The board groups open cards by the client and the claim or invoice number in the brief
-// Aries writes for each card. Grouping is only a view: every card keeps its own id, owner and
+// Aries writes for each card, plus shared thread IDs, property street addresses, and client
+// surnames in cleaned titles. Grouping is only a view: every card keeps its own id, owner and
 // actions, and nothing here changes what Aries published.
 
 /** @typedef {{tokens: string[], first: string, last: string}} Person */
@@ -31,6 +32,44 @@ const NICKNAMES = new Map([
   ['ed', 'edward'], ['greg', 'gregory'], ['jeff', 'jeffrey'], ['jon', 'jonathan'], ['annie', 'anne'],
 ])
 
+const TITLE_STOP = new Set([
+  'card', 'cards', 'task', 'tasks', 'item', 'items', 'urgent', 'review', 'invoice', 'claim', 'estimate',
+  'payment', 'call', 'reply', 'follow', 'followup', 'update', 'scope', 'work', 'water', 'damage',
+  'flood', 'mitigation', 'restoration', 'lien', 'check', 'carrier', 'adjuster', 'supplement', 'final',
+  'determination', 'status', 'action', 'needed', 'request', 'test', 'bad', 'good', 'new', 'old', 'open',
+  'done', 'aries', 'petsmart', 'lumina', 'pilates', 'lead', 'keep', 'private', 'errand', 'last', 'known',
+  'assignment', 'confirm', 'tomorrow', 'crew', 'chase', 'file', 'annual', 'fee', 'still', 'checked',
+  'mistake', 'made', 'from', 'email', 'never', 'came', 'prep', 'reopened', 'mailed', 'driveway',
+  'staining', 'oil', 'other', 'changed', 'instructions', 'secret', 'promotional', 'newsletter', 'routing',
+  'authorisation', 'authorization', 'documents', 'Coverage', 'coverage', 'decision', 'ready',
+])
+
+const DIR_MAP = new Map([
+  ['north', 'n'], ['n', 'n'],
+  ['south', 's'], ['s', 's'],
+  ['east', 'e'], ['e', 'e'],
+  ['west', 'w'], ['w', 'w'],
+])
+
+const SUFFIX_MAP = new Map([
+  ['street', 'st'], ['st', 'st'],
+  ['avenue', 'ave'], ['ave', 'ave'],
+  ['road', 'rd'], ['rd', 'rd'],
+  ['drive', 'dr'], ['dr', 'dr'],
+  ['lane', 'ln'], ['ln', 'ln'],
+  ['court', 'ct'], ['ct', 'ct'],
+  ['boulevard', 'blvd'], ['blvd', 'blvd'],
+  ['way', 'way'],
+  ['place', 'pl'], ['pl', 'pl'],
+  ['terrace', 'ter'], ['ter', 'ter'],
+  ['circle', 'cir'], ['cir', 'cir'],
+  ['parkway', 'pkwy'], ['pkwy', 'pkwy'],
+  ['highway', 'hwy'], ['hwy', 'hwy'],
+  ['trail', 'trl'], ['trl', 'trl'],
+])
+
+const STREET_STOP = new Set(['in', 'to', 'on', 'at', 'of', 'for', 'by', 'the', 'and', 'or', 'day', 'days', 'week'])
+
 /** @param {string} first */
 function canonicalFirst(first) {
   return NICKNAMES.get(first) || first
@@ -53,6 +92,89 @@ function sameFirst(left, right) {
 /** @param {string} text */
 function plain(text) {
   return text.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+}
+
+/**
+ * Strip reply/forward prefixes and leading bracket tags from an email subject or card title.
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function cleanSubject(text) {
+  let title = String(text || '').trim()
+  for (let pass = 0; pass < 8; pass += 1) {
+    const lower = title.toLowerCase()
+    const prefix = ['re:', 'fw:', 'fwd:'].find((word) => lower.indexOf(word) === 0)
+    const close = title.indexOf(']')
+    if (prefix) title = title.slice(prefix.length).trim()
+    else if (title.charAt(0) === '[' && close > 0 && close < 26) title = title.slice(close + 1).trim()
+    else break
+  }
+  return title || String(text || '').trim()
+}
+
+/**
+ * Extract normalized property street addresses (e.g., "1306 s poe st") and their display form
+ * from a cleaned title.
+ * @param {unknown} value
+ * @returns {Array<{key: string, label: string}>}
+ */
+export function extractStreetAddresses(value) {
+  if (typeof value !== 'string' || !value.trim()) return []
+  const cleaned = cleanSubject(value)
+  const regex = /\b(\d{1,6})\s+(?:(north|south|east|west|n|s|e|w)\.?\s+)?([a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+){0,2}?)\s+(street|st|avenue|ave|road|rd|drive|dr|lane|ln|court|ct|boulevard|blvd|way|place|pl|terrace|ter|circle|cir|parkway|pkwy|highway|hwy|trail|trl)\b/gi
+  /** @type {Array<{key: string, label: string}>} */
+  const results = []
+  const seen = new Set()
+  let match
+  while ((match = regex.exec(cleaned)) !== null) {
+    const number = match[1]
+    const rawDir = match[2] ? plain(match[2].replace(/\./g, '')) : ''
+    const dir = rawDir ? (DIR_MAP.get(rawDir) || rawDir) : ''
+    const rawStreet = plain(match[3]).trim().replace(/\s+/g, ' ')
+    const streetTokens = rawStreet.split(' ').filter(Boolean)
+    if (!streetTokens.length || streetTokens.some((tok) => STREET_STOP.has(tok))) continue
+    const rawSuffix = plain(match[4].replace(/\./g, ''))
+    const suffix = SUFFIX_MAP.get(rawSuffix) || rawSuffix
+    const key = [number, dir, rawStreet, suffix].filter(Boolean).join(' ')
+    if (seen.has(key)) continue
+    seen.add(key)
+    const displayDir = dir ? dir.toUpperCase() : ''
+    const displayStreet = streetTokens.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+    const displaySuffix = suffix.charAt(0).toUpperCase() + suffix.slice(1)
+    const label = [number, displayDir, displayStreet, displaySuffix].filter(Boolean).join(' ')
+    results.push({ key, label })
+  }
+  return results
+}
+
+/**
+ * Normalize a card's thread_id or source_url into a canonical thread key when available.
+ * @param {Record<string, any>} item
+ * @returns {string|null}
+ */
+export function extractThreadKey(item) {
+  if (!item || typeof item !== 'object') return null
+  if (typeof item.thread_id === 'string' && item.thread_id.trim()) {
+    const raw = item.thread_id.trim().toLowerCase().replace(/^(?:thread|msg|message)[_:-]/, '')
+    if (raw.length >= 4) return `thread:${raw}`
+  }
+  if (typeof item.source_url === 'string' && item.source_url.trim()) {
+    const rawUrl = item.source_url.trim()
+    const hashMatch = /#(?:all|inbox|sent|starred|imp|trash|spam|drafts|label\/[^/]+|search\/[^/]+)\/([A-Za-z0-9_-]{8,64})$/i.exec(rawUrl)
+    if (hashMatch) return `thread:${hashMatch[1].toLowerCase()}`
+    const paramMatch = /[?&](?:th|thread_id|message_id)=([A-Za-z0-9_-]{8,64})/i.exec(rawUrl)
+    if (paramMatch) return `thread:${paramMatch[1].toLowerCase()}`
+    try {
+      const parsed = new URL(rawUrl)
+      const tail = parsed.pathname.split('/').filter(Boolean).at(-1) || ''
+      if (/^[0-9a-f]{12,32}$/i.test(tail)) return `thread:${tail.toLowerCase()}`
+      const normalized = `${parsed.origin}${parsed.pathname}${parsed.search}${parsed.hash}`.toLowerCase()
+      if (normalized.length > 12) return `url:${normalized}`
+    } catch {
+      return `url:${rawUrl.toLowerCase()}`
+    }
+  }
+  return null
 }
 
 /**
@@ -114,6 +236,28 @@ export function parseClient(value, staff = new Set()) {
   people = people.filter((entry) => entry.first || !staff.has(entry.tokens.join(' ')))
   if (!people.length) return null
   return { people, org: '', rollup: people.length > 2 }
+}
+
+/**
+ * Extract a client candidate from a cleaned card title when brief.client is empty, e.g.
+ * "Malik: Travelers final determination" or "Badgett - roof tarp" or "King, 1306 S Poe St".
+ * @param {unknown} rawTitle
+ * @param {Set<string>} staff
+ * @returns {{client: Client, label: string}|null}
+ */
+function parseTitleClientPrefix(rawTitle, staff) {
+  const cleaned = cleanSubject(rawTitle)
+  if (!cleaned) return null
+  const prefixMatch = /^([A-Za-z][A-Za-z .'-]{1,42}?)(?:\s*[:—–-]\s+|\s*,\s+\d)/.exec(cleaned)
+  if (!prefixMatch) return null
+  const candidate = prefixMatch[1].trim()
+  const words = plain(candidate).split(/\s+/).filter(Boolean)
+  if (!words.length || words.length > 4) return null
+  if (words.some((w) => TITLE_STOP.has(w) || NOT_A_CLIENT.has(w) || staff.has(w))) return null
+  const parsed = parseClient(candidate, staff)
+  if (!parsed || parsed.rollup || parsed.org) return null
+  if (parsed.people.some((who) => TITLE_STOP.has(who.last) || (who.first && TITLE_STOP.has(who.first)))) return null
+  return { client: parsed, label: candidate }
 }
 
 /**
@@ -212,6 +356,8 @@ export function claimGroupDetails(items, options = {}) {
 
   /** @type {Map<number, Client|null>} */
   const clients = new Map()
+  /** @type {Map<number, string>} */
+  const clientLabels = new Map()
   /** @type {Map<string, number[]>} */
   const byNumber = new Map()
   /** @type {Map<string, number[]>} */
@@ -222,6 +368,12 @@ export function claimGroupDetails(items, options = {}) {
   const surnameOnly = []
   /** @type {Map<string, number[]>} */
   const byIdentity = new Map()
+  /** @type {Map<string, number[]>} */
+  const byThread = new Map()
+  /** @type {Map<string, number[]>} */
+  const byAddress = new Map()
+  /** @type {Map<number, Array<{key: string, label: string}>>} */
+  const cardAddresses = new Map()
 
   for (const item of open) {
     const brief = item.brief && typeof item.brief === 'object' ? item.brief : {}
@@ -232,8 +384,33 @@ export function claimGroupDetails(items, options = {}) {
     for (const number of claimNumbers(brief.claim)) {
       byNumber.set(number, [...(byNumber.get(number) || []), item.id])
     }
-    const client = parseClient(brief.client, staff)
+    const threadKey = extractThreadKey(item)
+    if (threadKey) {
+      byThread.set(threadKey, [...(byThread.get(threadKey) || []), item.id])
+    }
+    const addresses = [
+      ...extractStreetAddresses(item.title),
+      ...extractStreetAddresses(brief.title),
+    ]
+    if (addresses.length) {
+      cardAddresses.set(item.id, addresses)
+      const uniqueKeys = new Set(addresses.map((a) => a.key))
+      for (const addrKey of uniqueKeys) {
+        byAddress.set(addrKey, [...(byAddress.get(addrKey) || []), item.id])
+      }
+    }
+
+    let client = parseClient(brief.client, staff)
+    let writtenClient = typeof brief.client === 'string' ? brief.client.replace(/\s+/g, ' ').trim() : ''
+    if (!client) {
+      const fromTitle = parseTitleClientPrefix(brief.title || item.title, staff)
+      if (fromTitle) {
+        client = fromTitle.client
+        writtenClient = fromTitle.label
+      }
+    }
     clients.set(item.id, client)
+    if (writtenClient) clientLabels.set(item.id, writtenClient)
     if (!client || client.rollup) continue
     if (client.org) byOrg.set(client.org, [...(byOrg.get(client.org) || []), item.id])
     for (const who of client.people) {
@@ -245,8 +422,14 @@ export function claimGroupDetails(items, options = {}) {
   for (const [identity, ids] of byIdentity) {
     for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, `Matching explicit ${identity.split(':')[0].replace('_', ' ')}`)
   }
+  for (const ids of byThread.values()) {
+    for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching source email thread')
+  }
   for (const ids of byNumber.values()) {
     for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching claim or invoice number in the brief')
+  }
+  for (const ids of byAddress.values()) {
+    for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching property street address in title')
   }
   for (const ids of byOrg.values()) {
     for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching organisation name, identity not confirmed')
@@ -274,6 +457,23 @@ export function claimGroupDetails(items, options = {}) {
     for (let i = 0; i < ids.length; i += 1) for (const id of ids.slice(i + 1)) join(ids[i], id, 'Matching client surname, identity not confirmed')
   }
 
+  // Cards with an empty brief.client whose cleaned title mentions an unambiguous known client surname
+  for (const item of open) {
+    if (clients.get(item.id)) continue
+    const cleaned = plain(cleanSubject(item.brief?.title || item.title))
+    const words = cleaned.match(/[a-z]{4,}/g) || []
+    for (const word of words) {
+      if (TITLE_STOP.has(word) || NOT_A_CLIENT.has(word) || staff.has(word)) continue
+      const matches = named.get(word) || []
+      const loneIds = loneSurnames.get(word) || []
+      if (!matches.length && !loneIds.length) continue
+      const onePerson = matches.every((left) => matches.every((right) => sameFirst(left.who.first, right.who.first)))
+      if (!onePerson) continue
+      for (const match of matches) join(item.id, match.id, 'Matching client surname in title')
+      for (const otherId of loneIds) join(item.id, otherId, 'Matching client surname in title')
+    }
+  }
+
   /** @type {Map<number, Array<Record<string, any>>>} */
   const members = new Map()
   for (const item of open) {
@@ -295,11 +495,26 @@ export function claimGroupDetails(items, options = {}) {
         const client = clients.get(item.id)
         return client?.org ? [client.org] : (client?.people || []).map(who => `${who.last}:${canonicalFirst(who.first)}`)
       }).sort()
-      key = numbers.length ? `claim-number:${numbers[0]}` : names.length ? `client-name:${names[0]}` : `claim-${root}`
+      const addrs = [...new Set(group.flatMap(item => (cardAddresses.get(item.id) || []).map(a => a.key)))].sort()
+      const threads = [...new Set(group.map(item => extractThreadKey(item)).filter(Boolean))].sort()
+      key = numbers.length
+        ? `claim-number:${numbers[0]}`
+        : names.length
+        ? `client-name:${names[0]}`
+        : addrs.length
+        ? `address:${addrs[0]}`
+        : threads.length
+        ? `${threads[0]}`
+        : `claim-${root}`
     }
     const groupReasons = [...new Set(group.flatMap(item => [...(reasons.get(item.id) || [])]))]
-    const entry = { key, label: groupLabel(group, clients), reason: groupReasons[0] || 'Shared identity', reasons: groupReasons,
-      conflicts: group.flatMap(item => conflicts.get(item.id) || []) }
+    const entry = {
+      key,
+      label: groupLabel(group, clients, clientLabels, cardAddresses),
+      reason: groupReasons[0] || 'Shared identity',
+      reasons: groupReasons,
+      conflicts: group.flatMap(item => conflicts.get(item.id) || []),
+    }
     for (const item of group) groups.set(item.id, entry)
   }
   return { groups, conflicts }
@@ -307,17 +522,20 @@ export function claimGroupDetails(items, options = {}) {
 
 /**
  * The name on the claim card: the client line most cards use, then the one naming the most
- * people, then the shortest. A claim held together only by its number is called by it.
+ * people, then the shortest. A claim held together only by its number or street address is called by it.
  * @param {Array<Record<string, any>>} group
  * @param {Map<number, Client|null>} clients
+ * @param {Map<number, string>} clientLabels
+ * @param {Map<number, Array<{key: string, label: string}>>} cardAddresses
  */
-function groupLabel(group, clients) {
+function groupLabel(group, clients, clientLabels, cardAddresses) {
   /** @type {Map<string, {count: number, people: number}>} */
   const names = new Map()
   for (const item of group) {
     const client = clients.get(item.id)
     if (!client || client.rollup) continue
-    const written = String(item.brief.client).replace(/\s+/g, ' ').trim()
+    const written = clientLabels.get(item.id) || String(item.brief?.client || '').replace(/\s+/g, ' ').trim()
+    if (!written) continue
     const seen = names.get(written) || { count: 0, people: client.people.filter((who) => who.first).length }
     seen.count += 1
     names.set(written, seen)
@@ -326,6 +544,10 @@ function groupLabel(group, clients) {
     (right[1].count - left[1].count) || (right[1].people - left[1].people) || (left[0].length - right[0].length))
   if (ranked.length) return ranked[0][0]
   const claim = group.map((item) => item.brief && item.brief.claim).find((value) => typeof value === 'string' && value.trim())
-  if (!claim) return 'Same claim'
-  return /^(invoice|claim)\b/i.test(claim.trim()) ? claim.trim() : `Claim ${claim.trim()}`
+  if (claim) return /^(invoice|claim)\b/i.test(claim.trim()) ? claim.trim() : `Claim ${claim.trim()}`
+  for (const item of group) {
+    const addrs = cardAddresses.get(item.id)
+    if (addrs && addrs.length) return addrs[0].label
+  }
+  return 'Same claim'
 }

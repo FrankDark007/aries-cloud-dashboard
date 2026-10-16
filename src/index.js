@@ -3,6 +3,7 @@ import { CARD_HTML } from './card-ui.js'
 import { missionRequest, checkServices } from './mission.js'
 import { claimGroupDetails } from './claim-groups.js'
 import { curateCardMetadata, enrichBoardItems } from './card-data.js'
+import { isAutoResolvedCandidate } from './board-ui-state.js'
 import { commandReceipt, commandReceipts, receiveCommands, claimCommands, acknowledgeDelivery, retryCommand } from './command-queue.js'
 
 /**
@@ -28,7 +29,7 @@ import { commandReceipt, commandReceipts, receiveCommands, claimCommands, acknow
 
 const UI_HOST = 'aries.flood.doctor'
 const SYNC_HOST = 'aries-publish.flood.doctor'
-const UI_PATHS = new Set(['/', '/card', '/api/card', '/api/card/done', '/api/board', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist', '/api/thread'])
+const UI_PATHS = new Set(['/', '/card', '/api/card', '/api/card/done', '/api/board', '/api/board/auto-close-handled', '/api/action', '/api/todos', '/api/todo/action', '/api/worklist', '/api/thread'])
 // Served only to ACTIVITY_OWNER_EMAILS; every other identity gets the same 404 as a path
 // that does not exist, so staff never learn the log is there.
 const ACTIVITY_PATHS = new Set(['/activity', '/api/activity'])
@@ -102,6 +103,7 @@ const OTHER_NAMES = Object.freeze({
   'info@restorationdoctors.com': 'Office',
   'dave@flooddoctorva.com': 'Dave',
 })
+const AUTO_CLOSE_NOTE = 'Auto-closed: handled in email thread'
 const STRING_LIMITS = Object.freeze({
   title: 240,
   summary: 2000,
@@ -116,7 +118,9 @@ const STRING_LIMITS = Object.freeze({
   source_url: 2048,
   // Which mailbox the row came from and its Gmail thread (set by bin/cloud_dashboard_sync.py).
   account: 40,
-  thread_id: 64,
+  thread_id: 240,
+  mailbox: 240,
+  source_account: 240,
   snoozed_until: 80,
   // The day the card was opened (YYYY-MM-DD), so a card can say how long it has been waiting.
   created: 40,
@@ -1426,6 +1430,94 @@ function cardHistory(item, actions, names) {
     .slice(0, HISTORY_PER_CARD)
 }
 
+/**
+ * Auto-close cards that Aries detected were already handled in email.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {string} actorEmail
+ */
+async function autoCloseHandled(request, env, actorEmail) {
+  if (request.method !== 'POST') return methodNotAllowed('POST')
+  const contentType = request.headers.get('content-type') || ''
+  /** @type {Record<string, unknown>} */
+  let body = {}
+  if (contentType) {
+    if (!hasJsonContentType(request)) return unsupportedMediaType()
+    const parsed = await readJson(request)
+    if (parsed !== null) {
+      if (!isObject(parsed)) return badRequest('Invalid auto-close payload')
+      body = /** @type {Record<string, unknown>} */ (parsed)
+    }
+  }
+
+  /** @type {Set<number>|null} */
+  let requestedIds = null
+  if (body.ids !== undefined) {
+    if (!Array.isArray(body.ids) || body.ids.length > MAX_ITEMS) return badRequest('Invalid ids list')
+    requestedIds = new Set()
+    for (const rawId of body.ids) {
+      if (!Number.isSafeInteger(rawId) || Number(rawId) <= 0) return badRequest('Invalid card id in ids list')
+      requestedIds.add(Number(rawId))
+    }
+  }
+
+  const boardResponse = await getBoard(new Request(request.url, { method: 'GET', headers: request.headers }), env)
+  if (!boardResponse.ok) return boardResponse
+  const boardData = /** @type {{items: any[]}} */ (await boardResponse.json())
+  const candidates = (boardData.items || []).filter((item) => {
+    if ((item.status || 'open') !== 'open') return false
+    if (requestedIds) return requestedIds.has(item.id)
+    return item.auto_resolved_candidate === true || isAutoResolvedCandidate(item)
+  })
+
+  if (!candidates.length) {
+    return json({ ok: true, closed_count: 0, closed_ids: [], note: AUTO_CLOSE_NOTE, commands: [] }, 200)
+  }
+
+  const createdAt = new Date().toISOString()
+  /** @type {D1PreparedStatement[]} */
+  const statements = []
+  /** @type {Array<{item_id: number, operation: string, note: string, actor_email: string, created_at: string}>} */
+  const commands = []
+
+  for (const item of candidates) {
+    statements.push(
+      env.DB.prepare(`
+        INSERT INTO command_queue (operation, item_id, note, value, actor_email, state, created_at)
+        VALUES ('note', ?, ?, NULL, ?, 'queued', ?)
+      `).bind(item.id, AUTO_CLOSE_NOTE, actorEmail, createdAt),
+      env.DB.prepare(`
+        INSERT INTO command_queue (operation, item_id, note, value, actor_email, state, created_at)
+        VALUES ('done', ?, NULL, NULL, ?, 'queued', ?)
+      `).bind(item.id, actorEmail, createdAt),
+      activityStatement(env, request, {
+        at: createdAt,
+        actorEmail,
+        source: 'board',
+        operation: 'done',
+        itemId: String(item.id),
+        value: AUTO_CLOSE_NOTE,
+      }),
+    )
+    commands.push({
+      item_id: item.id,
+      operation: 'done',
+      note: AUTO_CLOSE_NOTE,
+      actor_email: actorEmail,
+      created_at: createdAt,
+    })
+  }
+
+  await env.DB.batch(statements)
+  return json({
+    ok: true,
+    closed_count: candidates.length,
+    closed_ids: candidates.map((c) => c.id),
+    note: AUTO_CLOSE_NOTE,
+    commands,
+  }, 202)
+}
+
 /** @param {Request} request @param {Env} env */
 async function getBoard(request, env) {
   if (request.method !== 'GET') return methodNotAllowed('GET')
@@ -1481,7 +1573,10 @@ async function getBoard(request, env) {
   for (const item of items) delete item.source_subject
   const latestReceipts = new Map()
   for (const receipt of receipts) if (!latestReceipts.has(receipt.item_id)) latestReceipts.set(receipt.item_id, receipt)
-  for (const item of items) item.command_receipt = latestReceipts.get(item.id) || null
+  for (const item of items) {
+    item.command_receipt = latestReceipts.get(item.id) || null
+    if (isAutoResolvedCandidate(item)) item.auto_resolved_candidate = true
+  }
 
   // Board actions from the audit trail, grouped per card, for each card's history.
   const since = new Date(Date.now() - HISTORY_DAYS * 86400000).toISOString()
@@ -1710,11 +1805,14 @@ async function latestTodoSequence(env) {
  * @param {TodoCatalogue} catalogue
  * @param {JsonObject[]} operations
  */
-function replayTodos(catalogue, operations) {
+function replayTodos(catalogue, operations, includeHistory = false) {
   /** @type {Map<string, JsonObject>} */
   const items = new Map()
+  const catalogueIds = new Set()
   for (const item of catalogue.items) {
-    items.set(/** @type {string} */ (item.id), {
+    const id = /** @type {string} */ (item.id)
+    catalogueIds.add(id)
+    items.set(id, {
       ...item,
       done: item.seedDone,
       attachments: [],
@@ -1734,7 +1832,7 @@ function replayTodos(catalogue, operations) {
       continue
     }
     let item = items.get(itemId)
-    if (!item && verb === 'toggle' && payload.done === true && isObject(payload.item)) {
+    if (!item && includeHistory && verb === 'toggle' && payload.done === true && isObject(payload.item)) {
       const snapshot = /** @type {JsonObject} */ (payload.item)
       item = {
         ...snapshot,
@@ -1775,7 +1873,7 @@ function replayTodos(catalogue, operations) {
     if (verb === 'archive') item.archived = payload.archived
     if (verb === 'delete') item.archived = true
   }
-  return [...items.values()]
+  return [...items.values()].filter((item) => includeHistory || catalogueIds.has(String(item.id)) || !item.archived)
 }
 
 /**
@@ -1784,6 +1882,9 @@ function replayTodos(catalogue, operations) {
  */
 async function getTodos(request, env) {
   if (request.method !== 'GET') return methodNotAllowed('GET')
+  const url = new URL(request.url)
+  // The board UI asks for active_only=1 to hide orphaned historical toggles; other callers keep history.
+  const includeHistory = url.searchParams.get('active_only') !== '1'
   const stored = await readTodoCatalogue(env)
   if (!stored) return json({ error: 'Todo catalogue unavailable' }, 503)
   const operations = await readTodoOperations(env, 0)
@@ -1797,7 +1898,7 @@ async function getTodos(request, env) {
     ? Math.max(0, Math.floor((Date.now() - publishedMillis) / 1000))
     : null
   return json({
-    items: replayTodos(stored.catalogue, /** @type {JsonObject[]} */ (operations)),
+    items: replayTodos(stored.catalogue, /** @type {JsonObject[]} */ (operations), includeHistory),
     published_at: stored.publishedAt,
     sequence,
     stale: {
@@ -2504,6 +2605,7 @@ export async function handleRequest(request, env) {
     }
     if (url.pathname === '/api/card' || url.pathname === '/api/card/done') return cardRequest(request, env, actorEmail)
     if (url.pathname === '/api/board') return getBoard(request, env)
+    if (url.pathname === '/api/board/auto-close-handled') return autoCloseHandled(request, env, actorEmail)
     if (url.pathname === '/api/action') return queueAction(request, env, actorEmail)
     if (url.pathname === '/api/todos') return getTodos(request, env)
     if (url.pathname === '/api/worklist') return getWorklist(request, env)

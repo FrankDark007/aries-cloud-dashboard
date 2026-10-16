@@ -43,7 +43,7 @@ export async function receiveCommands(db, limit) {
       AND received_at IS NULL AND attempts < ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
       ORDER BY id ASC LIMIT ?) AND state = 'queued' AND received_at IS NULL RETURNING *`
   ).bind(now, expires, MAX_ATTEMPTS, now, limit).all()
-  return rows.results.map(row => ({ id: row.id, operation: row.operation, item_id: row.item_id,
+  return rows.results.map((/** @type {any} */ row) => ({ id: row.id, operation: row.operation, item_id: row.item_id,
     note: row.note, value: row.value, actor_email: row.actor_email, created_at: row.created_at }))
 }
 
@@ -59,7 +59,7 @@ export async function claimCommands(db, limit, seconds = LEASE_SECONDS) {
       AND received_at IS NULL AND attempts < ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
       ORDER BY id ASC LIMIT ?) AND state = 'queued' AND lease_token IS NULL RETURNING *`
   ).bind(token, expires, now, MAX_ATTEMPTS, now, limit).all()
-  return rows.results.map(row => ({ id: row.id, operation: row.operation, item_id: row.item_id,
+  return rows.results.map((/** @type {any} */ row) => ({ id: row.id, operation: row.operation, item_id: row.item_id,
     note: row.note, value: row.value, actor_email: row.actor_email, created_at: row.created_at,
     lease_token: token, lease_expires_at: expires, attempt: row.attempts, idempotency_key: 'command-' + row.id }))
 }
@@ -67,7 +67,7 @@ export async function claimCommands(db, limit, seconds = LEASE_SECONDS) {
 /** @param {D1Database} db @param {number} id @param {string} status @param {string|null} detail @param {unknown} token */
 export async function acknowledgeDelivery(db, id, status, detail, token) {
   await expireLeases(db)
-  const row = await db.prepare('SELECT * FROM command_queue WHERE id = ?').bind(id).first()
+  const row = /** @type {any} */ (await db.prepare('SELECT * FROM command_queue WHERE id = ?').bind(id).first())
   if (!row || row.state !== 'queued') return { error: 'Command not found', status: 404 }
   if (row.lease_token && row.lease_token !== token) return { error: 'Processing lease does not match', status: 409 }
   const now = new Date().toISOString()
@@ -82,7 +82,7 @@ export async function acknowledgeDelivery(db, id, status, detail, token) {
 /** @param {D1Database} db @param {number} id */
 export async function retryCommand(db, id) {
   await expireLeases(db)
-  const row = await db.prepare('SELECT * FROM command_queue WHERE id = ?').bind(id).first()
+  const row = /** @type {any} */ (await db.prepare('SELECT * FROM command_queue WHERE id = ?').bind(id).first())
   if (!row) return { error: 'Command not found', status: 404 }
   if (row.state !== 'failed') return { error: 'Only failed commands can be retried', status: 409 }
   if (Number(row.attempts || 0) >= MAX_ATTEMPTS) return { error: 'Retry limit reached. Resolve this command at its source.', status: 409 }

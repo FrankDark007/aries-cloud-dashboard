@@ -1,3 +1,26 @@
+/** @param {any} item */
+export function isAutoResolvedCandidate(item) {
+  if (!item || (item.status || 'open') !== 'open') return false;
+  if (item.auto_resolved_candidate === true) return true;
+  const brief = item.brief || {};
+  if (brief.action === 'close' || brief.looks_done === true || item.looks_done === true) return true;
+  const oursAt = brief.last_ours && brief.last_ours.at ? Date.parse(brief.last_ours.at) : NaN;
+  const theirsAt = brief.last_theirs && brief.last_theirs.at ? Date.parse(brief.last_theirs.at) : NaN;
+  if (Number.isFinite(oursAt) && Number.isFinite(theirsAt) && oursAt > theirsAt && brief.action !== 'follow_up') return true;
+  return false;
+}
+
+/** @param {any} item @param {string} [today] */
+export function isStaleCard(item, today) {
+  if (!item || (item.status || 'open') !== 'open') return false;
+  const refMs = today && /^\d{4}-\d{2}-\d{2}$/.test(today) ? Date.parse(today + 'T23:59:59Z') : Date.now();
+  const stamp = item.updated || item.created || (item.brief && item.brief.waiting_since) || '';
+  if (!stamp) return false;
+  const atMs = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(String(stamp)) ? String(stamp) + 'T00:00:00Z' : String(stamp));
+  if (!Number.isFinite(atMs) || !Number.isFinite(refMs)) return false;
+  return (refMs - atMs) > 7 * 86400000;
+}
+
 /** @param {any} item @param {number} [now] */
 export function cardExceptions(item, now = Date.now()) {
   const issues = [];
@@ -31,15 +54,21 @@ export function matchesBoardFilters(item, filters, today) {
   const contains = (/** @type {any} */ value, /** @type {any} */ query) => lower(value).includes(lower(query).trim());
   const status = item.status || 'open';
   const owner = lower((item.responsibility || {}).owner || item.assignee);
-  const text = [item.id, item.title, item.summary, brief.client, brief.claim, brief.needs, brief.next_step, item.claim_label, identity.claim_id, identity.client_id, identity.invoice_id, owner].join(' ');
+  const mailbox = lower(item.mailbox || item.source_account);
+  const text = [item.id, item.title, item.summary, brief.client, brief.claim, brief.needs, brief.next_step, item.claim_label, identity.claim_id, identity.client_id, identity.invoice_id, owner, mailbox].join(' ');
   if (filters.query && !contains(text, filters.query)) return false;
   if (filters.owner && (filters.owner === 'unassigned' ? Boolean(owner) : owner !== lower(filters.owner))) return false;
   if (filters.client && !contains([brief.client, item.claim_label, identity.client_id].join(' '), filters.client)) return false;
   if (filters.claim && !contains([brief.claim, identity.claim_id, identity.invoice_id].join(' '), filters.claim)) return false;
+  if (filters.mailbox && !contains(mailbox, filters.mailbox)) return false;
   const urgent = Boolean(item.urgent) || lower(item.priority) === 'urgent';
   if (filters.urgency === 'urgent' && !urgent) return false;
   if (filters.urgency === 'normal' && urgent) return false;
   if (filters.status && status !== filters.status) return false;
+  if (filters.quick === 'ready' && !isAutoResolvedCandidate(item)) return false;
+  if (filters.quick === 'stale' && !isStaleCard(item, today)) return false;
+  if (filters.quick === 'urgent' && !urgent) return false;
+  if (filters.quick === 'unassigned' && Boolean(owner)) return false;
   const due = /^\d{4}-\d{2}-\d{2}/.test(String(item.due || '')) ? String(item.due).slice(0, 10) : '';
   if (filters.due === 'overdue' && (!due || due >= today)) return false;
   if (filters.due === 'today' && due !== today) return false;
@@ -57,13 +86,17 @@ export function commandReceiptText(receipt) {
 
 /** Build a frozen, reviewable plan. It never mutates cards. @param {any[]} items @param {Set<string>} selected @param {string} operation @param {string} value */
 export function bulkActionPlan(items, selected, operation, value) {
-  if (!['assign', 'snooze', 'duplicate-review'].includes(operation)) throw new Error('This bulk action is not supported.');
+  if (!['assign', 'snooze', 'duplicate-review', 'done'].includes(operation)) throw new Error('This bulk action is not supported.');
   if (operation === 'snooze' && !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('Choose a snooze date.');
   return items.filter(item => selected.has(String(item.id)) && item.status !== 'done').map(item => ({
-    id: item.id, title: item.title || '', operation, value,
+    id: item.id, title: item.title || '', operation, value: operation === 'done' ? '' : value,
     before: { assignee: item.assignee || '', due: item.due || '', status: item.status || 'open' },
     payload: {
-      ...(operation === 'duplicate-review' ? { id: item.id, operation: 'note', note: 'Duplicate review requested. Compare related cards and source evidence before changing or closing any card.' } : { id: item.id, operation, value }),
+      ...(operation === 'duplicate-review'
+        ? { id: item.id, operation: 'note', note: 'Duplicate review requested. Compare related cards and source evidence before changing or closing any card.' }
+        : operation === 'done'
+        ? { id: item.id, operation: 'done' }
+        : { id: item.id, operation, value }),
       expected: { command_id: item.command_receipt?.id || 0, assignee: item.assignee || '', due: item.due || '', status: item.status || 'open' },
     },
   }));
@@ -76,6 +109,7 @@ export function bulkUndoPayload(entry, item, receipt) {
   const expected = { command_id: receipt.id, assignee: item.assignee || '', due: item.due || '', status: item.status || 'open' };
   if (entry.operation === 'assign' && (item.assignee || '') === entry.value) return { id: item.id, operation: 'assign', value: entry.before.assignee, expected };
   if (entry.operation === 'snooze' && item.status === 'snoozed' && item.due === entry.value && entry.before.status === 'snoozed' && /^\d{4}-\d{2}-\d{2}$/.test(entry.before.due || '')) return { id: item.id, operation: 'snooze', value: entry.before.due, expected };
+  if (entry.operation === 'done' && item.status === 'done' && (entry.before.status || 'open') === 'open') return { id: item.id, operation: 'reopen', expected };
   return null;
 }
 
