@@ -114,6 +114,9 @@ const STRING_LIMITS = Object.freeze({
   // The Gmail permalink for the message a row came from. Read-only: the UI opens it,
   // the worker never fetches it.
   source_url: 2048,
+  // Which mailbox the row came from and its Gmail thread (set by bin/cloud_dashboard_sync.py).
+  account: 40,
+  thread_id: 64,
   snoozed_until: 80,
   // The day the card was opened (YYYY-MM-DD), so a card can say how long it has been waiting.
   created: 40,
