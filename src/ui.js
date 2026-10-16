@@ -793,6 +793,18 @@ ${BOARD_UPGRADE_DIALOGS}
       const restoreFocus = rememberFocus();
       board.dataset.layout = boardFilter === 'mine' ? 'list' : 'grid';
       const open = items.filter(boardScope).filter(inView).filter(filteredBoardItem).sort(function (left, right) {
+        if (filters.sort === 'created') {
+          const leftCreated = Date.parse(left.created || left.updated || '') || left.id || 0;
+          const rightCreated = Date.parse(right.created || right.updated || '') || right.id || 0;
+          if (rightCreated !== leftCreated) return rightCreated - leftCreated;
+          return (right.id || 0) - (left.id || 0);
+        }
+        if (filters.sort === 'assignee') {
+          const leftOwner = left.assignee ? nameOf(String(left.assignee).toLowerCase()).toLowerCase() : '\\uffff';
+          const rightOwner = right.assignee ? nameOf(String(right.assignee).toLowerCase()).toLowerCase() : '\\uffff';
+          const cmp = leftOwner.localeCompare(rightOwner);
+          if (cmp !== 0) return cmp;
+        }
         const urgent = Number(isUrgent(right)) - Number(isUrgent(left));
         if (urgent) return urgent;
         const leftDue = sortDeadline(left), rightDue = sortDeadline(right);

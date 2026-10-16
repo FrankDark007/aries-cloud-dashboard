@@ -58,6 +58,7 @@ export const BOARD_UPGRADE_CONTROLS = `
             <label>Urgency<select id="board-urgency"><option value="">Any urgency</option><option value="urgent">Urgent</option><option value="normal">Normal</option></select></label>
             <label>Due<select id="board-due"><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Today</option><option value="upcoming">Upcoming</option><option value="undated">No date</option></select></label>
             <label>Status<select id="board-status"><option value="">Active board</option><option value="open">Open</option><option value="snoozed">Snoozed</option><option value="done">Done</option></select></label>
+            <label>Sort by<select id="board-sort"><option value="urgent">Urgent</option><option value="created">Date Created</option><option value="assignee">Assignee</option></select></label>
             <label>Layout<select id="board-density"><option value="cards">Cards</option><option value="compact">Compact table</option></select></label>
           </div>
           <div class="board-tools"><button id="board-clear" class="refresh-button" type="button">Clear filters</button><button id="select-visible" class="refresh-button" type="button">Select shown</button><button id="clear-selected" class="refresh-button" type="button">Clear selection</button><button id="bulk-open" class="refresh-button" type="button" disabled>Review bulk action (0)</button><button id="bulk-undo" class="refresh-button" type="button" hidden>Review undo</button></div>
@@ -72,7 +73,7 @@ export const BOARD_UPGRADE_DIALOGS = `
 `
 
 export const BOARD_UPGRADE_SCRIPT = [cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems].map(fn => fn.toString()).join('\n') + String.raw`
-    const filters = { query:'', owner:'', client:'', claim:'', urgency:'', due:'', status:'' };
+    const filters = { query:'', owner:'', client:'', claim:'', urgency:'', due:'', status:'', sort:'urgent' };
     const selectedCards = new Set();
     const cardNodes = new Map();
     const groupNodes = new Map();
@@ -203,9 +204,9 @@ export const BOARD_UPGRADE_SCRIPT = [cardExceptions, matchesBoardFilters, comman
     ['bulk-operation','bulk-owner','bulk-date'].forEach(function(id){document.querySelector('#'+id).addEventListener('change',refreshBulkPreview);});
     document.querySelector('#select-visible').addEventListener('click',function(){visibleBoardItems().filter(function(item){return item.status!=='done';}).forEach(function(item){selectedCards.add(String(item.id));});render(boardItems);});
     document.querySelector('#clear-selected').addEventListener('click',function(){selectedCards.clear();render(boardItems);});
-    const filterFields={query:'board-search',owner:'board-owner',client:'board-client',claim:'board-claim',urgency:'board-urgency',due:'board-due',status:'board-status'};
+    const filterFields={query:'board-search',owner:'board-owner',client:'board-client',claim:'board-claim',urgency:'board-urgency',due:'board-due',status:'board-status',sort:'board-sort'};
     Object.keys(filterFields).forEach(function(key){document.querySelector('#'+filterFields[key]).addEventListener('input',function(){filters[key]=this.value;render(boardItems);});});
-    document.querySelector('#board-clear').addEventListener('click',function(){Object.keys(filterFields).forEach(function(key){filters[key]='';document.querySelector('#'+filterFields[key]).value='';});render(boardItems);});
+    document.querySelector('#board-clear').addEventListener('click',function(){Object.keys(filterFields).forEach(function(key){filters[key]=key==='sort'?'urgent':'';document.querySelector('#'+filterFields[key]).value=filters[key];});render(boardItems);});
     document.querySelector('#board-density').addEventListener('change',function(){board.dataset.density=this.value;render(boardItems);try{localStorage.setItem('aries-board-density',this.value);}catch(error){};});
     try{const density=localStorage.getItem('aries-board-density');if(density==='compact'){board.dataset.density=density;document.querySelector('#board-density').value=density;}}catch(error){}
     document.querySelector('#show-exceptions').addEventListener('click',function(){switchView('exceptions');});
