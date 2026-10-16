@@ -73,6 +73,7 @@ export const BOARD_UPGRADE_DIALOGS = `
 `
 
 export const BOARD_UPGRADE_SCRIPT = [isAutoResolvedCandidate, isStaleCard, cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems].map(fn => fn.toString()).join('\n') + String.raw`
+    var __name = function (target) { return target; };
     const filters = { query:'', owner:'', client:'', claim:'', urgency:'', due:'', status:'', sort:'urgent' };
     const selectedCards = new Set();
     const cardNodes = new Map();
