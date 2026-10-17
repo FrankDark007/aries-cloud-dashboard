@@ -4,6 +4,9 @@ export const BOARD_UPGRADE_CSS = `
     .summary-strip { padding: 12px 18px; margin-bottom: 16px; }
     .metric-value { font-size: 25px; }
     .board-controls { display: grid; gap: 10px; margin-bottom: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+    .quick-filters button[aria-pressed="true"] { background: var(--blue); color: white; }
+    .ready-banner { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; padding:14px; border:1px solid var(--blue); border-radius:10px; background:var(--surface); }
+    .ready-banner[hidden] { display:none; }
     .board-filters { display: grid; grid-template-columns: minmax(180px, 2fr) repeat(3, minmax(120px, 1fr)); gap: 10px; }
     .board-filters label, .bulk-fields label { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: 12px; font-weight: 700; }
     .board-filters input, .board-filters select, .owner-select, .bulk-fields input, .bulk-fields select { min-width: 0; width: 100%; min-height: 44px; padding: 8px 10px; border: 1px solid #bbc1ca; border-radius: 8px; background: white; color: var(--ink); font: inherit; }
@@ -50,6 +53,15 @@ export const BOARD_UPGRADE_CSS = `
 
 export const BOARD_UPGRADE_CONTROLS = `
         <div class="board-controls" aria-label="Board filters and triage">
+          <div id="ready-banner" class="ready-banner" hidden><strong id="ready-count" aria-live="polite"></strong><button id="close-all-handled" class="refresh-button" type="button">Close All Handled</button></div>
+          <div class="board-tools quick-filters" aria-label="Quick filters">
+            <button class="refresh-button" type="button" data-board-quick="all" aria-pressed="true">All</button>
+            <button class="refresh-button" type="button" data-board-quick="mine" aria-pressed="false">My Cards</button>
+            <button class="refresh-button" type="button" data-board-quick="ready" aria-pressed="false">⚡ Ready to Close</button>
+            <button class="refresh-button" type="button" data-board-quick="urgent" aria-pressed="false">Urgent</button>
+            <button class="refresh-button" type="button" data-board-quick="unassigned" aria-pressed="false">Unassigned</button>
+            <button class="refresh-button" type="button" data-board-quick="stale" aria-pressed="false">Stale &gt; 7d</button>
+          </div>
           <div class="board-filters">
             <label>Search cards<input id="board-search" type="search" placeholder="Task, client, claim or card number" autocomplete="off"></label>
             <label>Owner<select id="board-owner"><option value="">All owners</option><option value="unassigned">Unassigned</option></select></label>
@@ -74,7 +86,7 @@ export const BOARD_UPGRADE_DIALOGS = `
 
 export const BOARD_UPGRADE_SCRIPT = [isAutoResolvedCandidate, isStaleCard, cardExceptions, matchesBoardFilters, commandReceiptText, bulkActionPlan, bulkUndoPayload, reconcileBoardItems].map(fn => fn.toString()).join('\n') + String.raw`
     var __name = function (target) { return target; };
-    const filters = { query:'', owner:'', client:'', claim:'', urgency:'', due:'', status:'', sort:'urgent' };
+    const filters = { query:'', owner:'', client:'', claim:'', urgency:'', due:'', status:'', sort:'urgent', quick:'' };
     const selectedCards = new Set();
     const cardNodes = new Map();
     const groupNodes = new Map();
@@ -118,6 +130,13 @@ export const BOARD_UPGRADE_SCRIPT = [isAutoResolvedCandidate, isStaleCard, cardE
     }
     function receiptFor(entry) { if(!entry.command_id)return null;const receipt=currentReceipts.find(function (receipt) { return String(receipt.id) === String(entry.command_id); }) || (boardItems.find(function (item) { return item.id === entry.id; }) || {}).command_receipt;return receipt && String(receipt.id)===String(entry.command_id)?receipt:null; }
     function updateUpgradeChrome() {
+      const ready = boardItems.filter(isAutoResolvedCandidate);
+      document.querySelector('#ready-banner').hidden = ready.length === 0;
+      document.querySelector('#ready-count').textContent = '⚡ Ready to Close (' + ready.length + ')';
+      document.querySelectorAll('[data-board-quick]').forEach(function(button) {
+        button.setAttribute('aria-pressed', String(button.dataset.boardQuick === (boardFilter === 'mine' ? 'mine' : filters.quick || 'all')));
+        if (button.dataset.boardQuick === 'mine') button.disabled = !me;
+      });
       const shown = visibleBoardItems();
       document.querySelector('#board-scope').textContent = shown.length + ' cards shown of ' + boardItems.length + ' published cards. ' + (activeView === 'exceptions' ? 'Exceptions require source or runner review.' : 'Board is the curated operational collection. To-Do and Full list have separate scopes.');
       const bulkButton = document.querySelector('#bulk-open');
@@ -205,9 +224,31 @@ export const BOARD_UPGRADE_SCRIPT = [isAutoResolvedCandidate, isStaleCard, cardE
     ['bulk-operation','bulk-owner','bulk-date'].forEach(function(id){document.querySelector('#'+id).addEventListener('change',refreshBulkPreview);});
     document.querySelector('#select-visible').addEventListener('click',function(){visibleBoardItems().filter(function(item){return item.status!=='done';}).forEach(function(item){selectedCards.add(String(item.id));});render(boardItems);});
     document.querySelector('#clear-selected').addEventListener('click',function(){selectedCards.clear();render(boardItems);});
+    document.querySelectorAll('[data-board-quick]').forEach(function(button) {
+      button.addEventListener('click', function() {
+        const quick = button.dataset.boardQuick;
+        filters.quick = quick === 'all' || quick === 'mine' ? '' : quick;
+        filters.status = ''; document.querySelector('#board-status').value = '';
+        switchView(quick === 'mine' ? 'mine' : 'board');
+      });
+    });
+    document.querySelector('#close-all-handled').addEventListener('click', async function() {
+      const button = this;
+      const ids = boardItems.filter(isAutoResolvedCandidate).map(function(item) { return item.id; });
+      if (!ids.length) return;
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/board/auto-close-handled', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ids:ids})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Could not queue handled cards');
+        showToast(result.closed_count + ' handled cards queued for closing. Check receipts for completion.');
+        await loadBoard();
+      } catch (error) { showToast(error.message || 'Could not queue handled cards', true); }
+      finally { button.disabled = false; }
+    });
     const filterFields={query:'board-search',owner:'board-owner',client:'board-client',claim:'board-claim',urgency:'board-urgency',due:'board-due',status:'board-status',sort:'board-sort'};
     Object.keys(filterFields).forEach(function(key){document.querySelector('#'+filterFields[key]).addEventListener('input',function(){filters[key]=this.value;render(boardItems);});});
-    document.querySelector('#board-clear').addEventListener('click',function(){Object.keys(filterFields).forEach(function(key){filters[key]=key==='sort'?'urgent':'';document.querySelector('#'+filterFields[key]).value=filters[key];});render(boardItems);});
+    document.querySelector('#board-clear').addEventListener('click',function(){filters.quick='';boardFilter='all';Object.keys(filterFields).forEach(function(key){filters[key]=key==='sort'?'urgent':'';document.querySelector('#'+filterFields[key]).value=filters[key];});render(boardItems);});
     document.querySelector('#board-density').addEventListener('change',function(){board.dataset.density=this.value;render(boardItems);try{localStorage.setItem('aries-board-density',this.value);}catch(error){};});
     try{const density=localStorage.getItem('aries-board-density');if(density==='compact'){board.dataset.density=density;document.querySelector('#board-density').value=density;}}catch(error){}
     document.querySelector('#show-exceptions').addEventListener('click',function(){switchView('exceptions');});

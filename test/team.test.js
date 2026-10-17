@@ -131,7 +131,8 @@ test('changing an email keeps the old address as his, so his history and his To-
   const fromOld = await worker.fetch(todo('mark@flood.doctor', 'ui-old-address'), settings(db), {})
   assert.equal(fromOld.status, 202)
   const steve = await worker.fetch(todo('steve@restorationdoctors.com', 'ui-steve'), settings(db), {})
-  assert.equal(steve.status, 403, 'the To-Do list keeps its three writers')
+  assert.equal(steve.status, 202, 'every roster member can edit To-Do')
+  assert.equal((await steve.json()).operation.actor_name, 'Steve')
 
   // Changing it again pushes the newer old address to the front and never lists the current one.
   await worker.fetch(saveUser(OWNER, { key: 'mark', name: 'Mike', email: 'mark@flood.doctor' }), settings(db), {})

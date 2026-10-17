@@ -95,8 +95,6 @@ const MAX_TEAM = 30
 const MAX_PAST_EMAILS = 10
 // Frank signs in with an address that is not his company one.
 const SIGN_IN_ALIASES = Object.freeze({ 'darakhshan.farough@gmail.com': 'frank' })
-// Who may change the To-Do list, by key, so a changed email keeps working.
-const TODO_ACTOR_KEYS = Object.freeze(['frank', 'mark'])
 // Mailboxes that show up in card history but are not people on the roster.
 const OTHER_NAMES = Object.freeze({
   'aries@flood.doctor': 'Aries',
@@ -1444,10 +1442,8 @@ async function autoCloseHandled(request, env, actorEmail) {
   if (contentType) {
     if (!hasJsonContentType(request)) return unsupportedMediaType()
     const parsed = await readJson(request)
-    if (parsed !== null) {
-      if (!isObject(parsed)) return badRequest('Invalid auto-close payload')
-      body = /** @type {Record<string, unknown>} */ (parsed)
-    }
+    if (!isObject(parsed)) return badRequest('Invalid auto-close payload')
+    body = /** @type {Record<string, unknown>} */ (parsed)
   }
 
   /** @type {Set<number>|null} */
@@ -1466,7 +1462,7 @@ async function autoCloseHandled(request, env, actorEmail) {
   const boardData = /** @type {{items: any[]}} */ (await boardResponse.json())
   const candidates = (boardData.items || []).filter((item) => {
     if ((item.status || 'open') !== 'open') return false
-    if (requestedIds) return requestedIds.has(item.id)
+    if (requestedIds && !requestedIds.has(item.id)) return false
     return item.auto_resolved_candidate === true || isAutoResolvedCandidate(item)
   })
 
@@ -2134,7 +2130,7 @@ async function saveTodoAction(request, env, actorEmail) {
   if (request.method !== 'POST') return methodNotAllowed('POST')
   if (!hasJsonContentType(request)) return unsupportedMediaType()
   const member = memberFor(await loadTeam(env), actorEmail)
-  const actorName = member && TODO_ACTOR_KEYS.includes(member.key) ? member.name : null
+  const actorName = member ? member.name : null
   if (!actorName) return forbidden()
   const operation = curateOperation(await readJson(request), { email: actorEmail, name: actorName })
   if (!operation) return badRequest('Invalid todo action')

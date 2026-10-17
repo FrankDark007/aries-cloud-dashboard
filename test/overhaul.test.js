@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import worker from '../src/index.js'
-import { claimGroups, extractStreetAddresses, extractThreadKey } from '../src/claim-groups.js'
+import { claimNumbers, claimGroups, extractStreetAddresses, extractThreadKey } from '../src/claim-groups.js'
 import { bulkActionPlan, isAutoResolvedCandidate, isStaleCard, matchesBoardFilters } from '../src/board-ui-state.js'
 import { SqliteD1 } from './sqlite-d1.js'
 
@@ -102,6 +102,14 @@ test('Fix 1: classifies auto_resolved_candidate cards and auto-closes them via P
   assert.equal(byId.get(503).auto_resolved_candidate, undefined)
   assert.equal(byId.get(504).auto_resolved_candidate, undefined)
 
+  for (const body of ['{', JSON.stringify({ids:[503,504]})]) {
+    const response = await worker.fetch(new Request(`https://${UI_HOST}/api/board/auto-close-handled`, {
+      method:'POST', headers:{'Cf-Access-Authenticated-User-Email':'frankd@flooddoctorva.com','content-type':'application/json'}, body,
+    }), env, {})
+    assert.equal(response.status, body === '{' ? 400 : 200)
+    if (response.ok) assert.equal((await response.json()).closed_count, 0)
+  }
+
   // Auto-close all candidates
   const closeRes = await worker.fetch(new Request(`https://${UI_HOST}/api/board/auto-close-handled`, {
     method: 'POST',
@@ -173,4 +181,9 @@ test('Fix 1 & 4: bulkActionPlan supports done and matchesBoardFilters supports q
   const plan = bulkActionPlan(items, new Set(['1', '2']), 'done', '')
   assert.equal(plan.length, 2)
   assert.deepEqual(plan.map(p => [p.id, p.payload.operation]), [[1, 'done'], [2, 'done']])
+})
+
+test('claim numbers accept item metadata without treating street numbers as claims', () => {
+  assert.deepEqual(claimNumbers({brief:{claim:'USAA 021792489-801'}}), ['021792489801'])
+  assert.deepEqual(claimNumbers('Invoice 1120 at 1306 Main Street'), [])
 })

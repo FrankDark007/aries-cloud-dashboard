@@ -268,6 +268,7 @@ function parseTitleClientPrefix(rawTitle, staff) {
  * @returns {string[]}
  */
 export function claimNumbers(value) {
+  if (value && typeof value === 'object') value = /** @type {any} */ (value).brief?.claim
   if (typeof value !== 'string') return []
   const found = plain(value).match(/[a-z0-9_-]*\d[a-z0-9_-]*/g) || []
   return [...new Set(found
