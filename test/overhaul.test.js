@@ -47,6 +47,8 @@ test('Fix 1: classifies auto_resolved_candidate cards and auto-closes them via P
       title: 'Badgett claim closed confirmation',
       status: 'open',
       mailbox: 'aries@flood.doctor',
+      account: 'aries',
+      thread_id: 'thread123456',
       brief: baseBrief({ action: 'close' }),
     },
     {
@@ -97,6 +99,8 @@ test('Fix 1: classifies auto_resolved_candidate cards and auto-closes them via P
 
   assert.equal(byId.get(501).auto_resolved_candidate, true)
   assert.equal(byId.get(501).mailbox, 'aries@flood.doctor')
+  assert.equal(byId.get(501).source_account, 'aries')
+  assert.equal(Object.hasOwn(byId.get(501), 'account'), false)
   assert.equal(byId.get(502).auto_resolved_candidate, true)
   assert.equal(byId.get(502).source_account, 'steve@restorationdoctors.com')
   assert.equal(byId.get(503).auto_resolved_candidate, undefined)

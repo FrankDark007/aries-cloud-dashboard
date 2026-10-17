@@ -52,7 +52,7 @@ test('publishes a curated snapshot and serves it to an authenticated teammate', 
     note: 'Confirm depreciation line.',
     updated: '2026-08-24T12:00:00Z',
     msg_id: 'must-not-leave-aries',
-    account: 'mark',
+    account: 'must-not-leave-aries',
   }]
 
   const publish = await worker.fetch(syncRequest('/api/sync/snapshot', {
@@ -82,13 +82,12 @@ test('publishes a curated snapshot and serves it to an authenticated teammate', 
     kind: 'claim',
     note: 'Confirm depreciation line.',
     updated: '2026-08-24T12:00:00Z',
-    account: 'mark',
   }])
   assert.equal(payload.items[0].responsibility.owner, 'Mark')
   assert.equal(payload.items[0].quality.status, 'unverified')
   assert.deepEqual(payload.items[0].financials, [])
   assert.equal(Object.hasOwn(payload.items[0], 'msg_id'), false)
-  assert.equal(payload.items[0].account, 'mark')
+  assert.equal(Object.hasOwn(payload.items[0], 'account'), false)
 })
 
 test('serves a stale last-known snapshot when Aries is offline', async () => {

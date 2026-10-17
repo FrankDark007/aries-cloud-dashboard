@@ -115,7 +115,6 @@ const STRING_LIMITS = Object.freeze({
   // the worker never fetches it.
   source_url: 2048,
   // Which mailbox the row came from and its Gmail thread (set by bin/cloud_dashboard_sync.py).
-  account: 40,
   thread_id: 240,
   mailbox: 240,
   source_account: 240,
@@ -531,6 +530,11 @@ function curateItem(item, tally, owners = DEFAULT_BRIEF_OWNERS) {
     if (field === 'title' || source[field] === undefined || source[field] === null) continue
     if (typeof source[field] !== 'string' || source[field].length > limit) return null
     curated[field] = source[field]
+  }
+  // Publish mailbox context for thread links without exposing legacy account metadata.
+  if (curated.thread_id && !curated.source_account && typeof source.account === 'string') {
+    if (source.account.length > STRING_LIMITS.source_account) return null
+    curated.source_account = source.account
   }
   if (source.priority !== undefined && source.priority !== null) {
     const validNumber = typeof source.priority === 'number' && Number.isFinite(source.priority)
